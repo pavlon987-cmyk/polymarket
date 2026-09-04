@@ -1,0 +1,26 @@
+﻿# Dependencies
+node_modules/
+/.pnp
+.pnp.js
+
+# Next.js build output
+.next/
+out/
+build/
+dist/
+
+# Database & local data
+.pgdata/
+*.log
+
+# Environment variables (NEVER commit secrets!)
+.env
+.env*.local
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# OS files
+.DS_Store
+Thumbs.db
