@@ -1,9 +1,10 @@
 import type { PortfolioRow, PositionRow, Settings, StrategyConfigRow, Whale } from "@/db/schema";
 import { chatCompletion } from "./ai";
 import { detectCryptoMarket, getCryptoPrice } from "./crypto";
-import { openGuarded } from "./engine";
+import { openGuarded, sellPosition } from "./engine";
 import { createExecutor, type Executor } from "./executor";
-import { alreadyHeld } from "./ledger";
+import { alreadyHeld, computeLedger } from "./ledger";
+import { withCycleLock } from "./lock";
 import { buildMemoryBlock, remember, rememberStrategyResult } from "./memory";
 import { sendTelegram } from "./notify";
 import { aggregateWhales, PolymarketClient } from "./polymarket";
@@ -27,7 +28,11 @@ const usd = (n: number) => `$${Math.abs(n).toFixed(2)}`;
 const cents = (p: number) => `${(p * 100).toFixed(0)}¢`;
 const short = (s: string, n = 45) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const hoursToEnd = (m: MarketInfo) => (m.endDate ? (new Date(m.endDate).getTime() - Date.now()) / 3_600_000 : null);
-const num = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+const num = (v: unknown, d: number) => {
+  if (typeof v === "boolean") return v ? 1 : 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
 
 export type StrategyParams = Record<string, number | string | boolean>;
 export type StrategyResult = { scanned: number; opened: number; skipped: number; notes: string[] };
@@ -63,18 +68,18 @@ function res(): StrategyResult {
 const held = (ctx: StrategyBase) => new Set(ctx.open.map((p) => p.conditionId));
 const mineOpen = (ctx: StrategyContext) => ctx.open.filter((p) => p.source === ctx.cfg.id).length;
 
-export async function canOpen(ctx: StrategyContext, conditionId?: string): Promise<string | null> {
+export async function canOpen(ctx: StrategyContext, conditionId?: string, allowMultiLeg = false): Promise<string | null> {
   if (ctx.portfolio.halted) return "портфель остановлен стоп-лоссом";
   if (ctx.open.length >= ctx.settings.maxOpenPositions) return `общий лимит позиций ${ctx.settings.maxOpenPositions}`;
   if (mineOpen(ctx) >= ctx.cfg.maxPositions) return `лимит стратегии ${ctx.cfg.maxPositions}`;
   if (ctx.portfolio.cashUsd < 1) return "нет кэша";
-  if (conditionId && (await alreadyHeld(ctx.mode, conditionId))) return "рынок уже в портфеле (БД)";
+  if (!allowMultiLeg && conditionId && (await alreadyHeld(ctx.mode, conditionId))) return "рынок уже в портфеле (БД)";
   return null;
 }
 
 export async function openPosition(
   ctx: StrategyContext,
-  a: { market: MarketInfo; outcomeIndex: number; price: number; usd: number; reason: string; confidence?: number; label?: string }
+  a: { market: MarketInfo; outcomeIndex: number; price: number; usd: number; reason: string; confidence?: number; label?: string; allowMultiLeg?: boolean }
 ): Promise<PositionRow | null> {
   const def = STRATEGIES.find((d) => d.id === ctx.cfg.id)!;
   return openGuarded(
@@ -92,6 +97,7 @@ export async function openPosition(
       label: a.label ?? `🧠 ${def.emoji} ${def.name}`,
       reason: a.reason,
       confidence: a.confidence,
+      allowMultiLeg: a.allowMultiLeg,
     }
   );
 }
@@ -189,21 +195,28 @@ export const STRATEGIES: StrategyDef[] = [
         const [y, n] = m.outcomePrices;
         const spread = (1 - (y + n)) * 100;
         if (spread < ctx.p("minSpreadPct", 1.5) || h.has(m.conditionId)) continue;
-        const gate = await canOpen(ctx, m.conditionId);
+        const gate = await canOpen(ctx, undefined, true);
         if (gate) {
           r.notes.push(gate);
           break;
         }
-        const bet = Math.min(ctx.cfg.maxBetUsd, ctx.portfolio.cashUsd / 2);
-        if (bet < 1) break;
-        ctx.log(`   🎯 ${short(m.question)}: ${cents(y)} + ${cents(n)} → спред ${spread.toFixed(2)}%`);
+        if (!(y > 0 && n > 0 && y + n < 0.985)) continue;
+        const totalBudget = Math.min(ctx.cfg.maxBetUsd, ctx.portfolio.cashUsd);
+        const targetShares = Math.floor((totalBudget / (y + n)) * 100) / 100;
+        if (targetShares < 1) break;
+        const betA = Math.floor(targetShares * y * 100) / 100;
+        const betB = Math.floor(targetShares * n * 100) / 100;
+        if (betA < 0.5 || betB < 0.5) break;
+
+        ctx.log(`   🎯 ${short(m.question)}: ${cents(y)} + ${cents(n)} = ${cents(y + n)} → спред ${spread.toFixed(2)}%, целевой объём ${targetShares.toFixed(1)} шт.`);
         const a = await openPosition(ctx, {
           market: m,
           outcomeIndex: 0,
           price: y,
-          usd: bet,
-          reason: `арбитраж, спред ${spread.toFixed(2)}%`,
-          confidence: 0.95,
+          usd: betA,
+          reason: `арбитраж Yes+No (${targetShares.toFixed(1)} шт.), спред ${spread.toFixed(2)}%`,
+          confidence: 0.98,
+          allowMultiLeg: true,
         });
         if (!a) {
           r.skipped++;
@@ -213,13 +226,31 @@ export const STRATEGIES: StrategyDef[] = [
           market: m,
           outcomeIndex: 1,
           price: n,
-          usd: bet,
-          reason: `арбитраж (вторая нога), спред ${spread.toFixed(2)}%`,
-          confidence: 0.95,
+          usd: betB,
+          reason: `арбитраж Yes+No (вторая нога), спред ${spread.toFixed(2)}%`,
+          confidence: 0.98,
+          allowMultiLeg: true,
         });
         if (!b) {
-          const back = await ctx.executor.sell({ tokenId: a.tokenId, shares: a.shares, price: y, market: m.question });
-          ctx.log(`   ↩️ вторая нога не исполнена — откат первой (${back.ok ? "ок" : back.error})`);
+          const rolledBack = await sellPosition(
+            {
+              settings: ctx.settings,
+              mode: ctx.mode,
+              portfolio: ctx.portfolio,
+              ledger: await computeLedger(ctx.mode),
+              api: ctx.api,
+              executor: ctx.executor,
+              open: ctx.open,
+              closed: [],
+              notes: [],
+              whaleTrades: ctx.whaleTrades,
+              log: async (_lvl, msg) => { ctx.log(msg); },
+            },
+            a,
+            y,
+            "откат арбитража — вторая нога не исполнилась"
+          );
+          ctx.log(`   ↩️ вторая нога не исполнена — откат первой (${rolledBack ? "ок" : "ошибка"})`);
           r.skipped++;
           continue;
         }
@@ -570,10 +601,10 @@ export const STRATEGIES: StrategyDef[] = [
       }
       const known = new Set((await listWhales()).map((w) => w.address.toLowerCase()));
       const cands = aggregateWhales(await ctx.api.fetchRecentTrades(300), 20)
-        .filter((c: any) => !known.has(c.wallet.toLowerCase()))
+        .filter((c) => !known.has(c.address.toLowerCase()))
         .slice(0, ctx.p("maxCheck", 5));
       r.scanned = cands.length;
-      const scores = await batchVerify(ctx.api, cands.map((c: any) => c.wallet), ctx.settings, ctx.log);
+      const scores = await batchVerify(ctx.api, cands.map((c) => c.address), ctx.settings, ctx.log);
       for (const s of scores) {
         await upsertVerifiedWallet({
           address: s.address,
@@ -630,7 +661,17 @@ export async function loadConfigs(): Promise<Map<string, StrategyConfigRow>> {
 
 function ctxFor(base: StrategyBase, cfg: StrategyConfigRow): StrategyContext {
   const def = STRATEGIES.find((d) => d.id === cfg.id)!;
-  return { ...base, cfg, p: (k, d) => num(cfg.params[k], num(def.defaults.params[k], d)) };
+  return {
+    ...base,
+    cfg,
+    p: (k, d) => {
+      const val = cfg.params?.[k];
+      const defVal = def?.defaults?.params?.[k];
+      if (typeof val === "boolean") return val ? 1 : 0;
+      if (typeof defVal === "boolean" && val === undefined) return defVal ? 1 : 0;
+      return num(val, num(defVal, d));
+    },
+  };
 }
 
 export function makeMarketsLoader(api: PolymarketClient, settings: Settings) {
@@ -687,32 +728,39 @@ export async function runStrategies(base: StrategyBase): Promise<Record<string, 
 
 /** Ручной запуск одной стратегии (API) */
 export async function runSingleStrategy(id: string): Promise<StrategyResult & { mode: TradingMode; notesLog: string[] }> {
-  const def = STRATEGIES.find((d) => d.id === id);
-  if (!def?.run) throw new Error("Стратегия не найдена или не запускается вручную");
-  const settings = await getSettings();
-  if (def.needsAi && !settings.aiEnabled) throw new Error("Нужен включённый ИИ (Настройки → ИИ)");
-  const notesLog: string[] = [];
-  const log = (m: string) => {
-    notesLog.push(m);
-    console.log(m);
-  };
-  const { executor, mode } = createExecutor(settings, log);
-  const api = new PolymarketClient({ settings, log });
-  const portfolio = await getPortfolio(mode, settings);
-  const base: StrategyBase = {
-    settings,
-    mode,
-    portfolio,
-    api,
-    executor,
-    open: await openPositions(mode),
-    whales: (await listWhales()).filter((w) => w.enabled),
-    whaleTrades: new Map(),
-    markets: makeMarketsLoader(api, settings),
-    log,
-  };
-  const cfg = (await loadConfigs()).get(id)!;
-  const r = await def.run(ctxFor(base, cfg));
-  await savePortfolio(portfolio);
-  return { ...r, mode, notesLog };
+  const lock = await withCycleLock(`manual_${id}`, async () => {
+    const def = STRATEGIES.find((d) => d.id === id);
+    if (!def?.run) throw new Error("Стратегия не найдена или не запускается вручную");
+    const settings = await getSettings();
+    if (def.needsAi && !settings.aiEnabled) throw new Error("Нужен включённый ИИ (Настройки → ИИ)");
+    const notesLog: string[] = [];
+    const log = (m: string) => {
+      notesLog.push(m);
+      console.log(m);
+    };
+    const { executor, mode } = createExecutor(settings, log);
+    const api = new PolymarketClient({ settings, log });
+    const portfolio = await getPortfolio(mode, settings);
+    const base: StrategyBase = {
+      settings,
+      mode,
+      portfolio,
+      api,
+      executor,
+      open: await openPositions(mode),
+      whales: (await listWhales()).filter((w) => w.enabled),
+      whaleTrades: new Map(),
+      markets: makeMarketsLoader(api, settings),
+      log,
+    };
+    const cfg = (await loadConfigs()).get(id)!;
+    const r = await def.run(ctxFor(base, cfg));
+    await savePortfolio(portfolio);
+    return { ...r, mode, notesLog };
+  });
+
+  if (!lock.acquired) {
+    throw new Error("Сейчас выполняется другой торговый цикл или операция. Попробуйте через 10 секунд.");
+  }
+  return lock.result;
 }

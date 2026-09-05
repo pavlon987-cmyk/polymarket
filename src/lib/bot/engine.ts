@@ -210,16 +210,33 @@ async function runCycleLocked(trigger: string, startedAt: string): Promise<Cycle
  *  b) рынок истёк (endDate + 10 мин) и стакан пуст → берём gamma outcomePrices, если они крайние
  *  c) рынок истёк > 6 ч назад и ничего не известно → считаем по последней цене (SOLD по lastPrice), чтобы не висел вечно
  */
-function resolutionOf(market: MarketInfo, pos: PositionRow, now = Date.now()): { status: "WON" | "LOST"; reason: string } | null {
+export function resolutionOf(market: MarketInfo, pos: PositionRow, now = Date.now()): { status: "WON" | "LOST"; reason: string } | null {
+  // 1. Точный результат через токены CLOB (если есть флаг winner)
+  if (market.tokens?.length) {
+    const ourToken = market.tokens.find(
+      (t) => t.tokenId === pos.tokenId || t.outcome?.toLowerCase() === pos.outcome?.toLowerCase()
+    );
+    if (ourToken && ourToken.winner !== undefined) {
+      if (ourToken.winner === true) return { status: "WON", reason: "Рынок закрыт (CLOB winner=true)" };
+      if (ourToken.winner === false && market.closed) return { status: "LOST", reason: "Рынок закрыт (CLOB winner=false)" };
+    }
+  }
+
   const px = market.outcomePrices[pos.outcomeIndex];
   const ended = market.endDate ? new Date(market.endDate).getTime() + 10 * 60_000 < now : false;
-  const resolved = market.closed || market.umaResolutionStatus === "resolved";
-  if (resolved && Number.isFinite(px)) {
-    return px >= 0.5 ? { status: "WON", reason: "Рынок завершён (resolved)" } : { status: "LOST", reason: "Рынок завершён (resolved)" };
+
+  // 2. Официальный резолв UMA (только при явной цене 1 / 0 или экстремальных значениях)
+  if (market.umaResolutionStatus === "resolved" && Number.isFinite(px)) {
+    if (px >= 0.95) return { status: "WON", reason: "Рынок завершён UMA (исход подтверждён)" };
+    if (px <= 0.05) return { status: "LOST", reason: "Рынок завершён UMA (исход 0)" };
   }
-  if (ended && Number.isFinite(px) && (px >= 0.98 || px <= 0.02)) {
-    return px >= 0.98 ? { status: "WON", reason: "Рынок истёк, цена ≥ 98¢" } : { status: "LOST", reason: "Рынок истёк, цена ≤ 2¢" };
+
+  // 3. Рынок закрыт или истёк — только при подтверждённых крайних ценах (≥98¢ / ≤2¢), но НЕ по 0.5
+  if ((market.closed || ended) && Number.isFinite(px)) {
+    if (px >= 0.98) return { status: "WON", reason: "Рынок завершён, цена ≥ 98¢" };
+    if (px <= 0.02) return { status: "LOST", reason: "Рынок завершён, цена ≤ 2¢" };
   }
+
   return null;
 }
 
@@ -318,7 +335,7 @@ export async function sellPosition(ctx: Ctx, pos: PositionRow, price: number, re
   return true;
 }
 
-async function finalizePosition(ctx: Ctx, pos: PositionRow, status: string, payoutUsd: number, profitUsd: number, reason: string) {
+export async function finalizePosition(ctx: Ctx, pos: PositionRow, status: string, payoutUsd: number, profitUsd: number, reason: string) {
   pos.status = status;
   pos.payoutUsd = payoutUsd;
   pos.profitUsd = profitUsd;
@@ -358,6 +375,7 @@ export async function openGuarded(
     whaleTradeHash?: string | null;
     whaleSizeShares?: number | null;
     aiDecision?: PositionRow["aiDecision"];
+    allowMultiLeg?: boolean;
   }
 ): Promise<PositionRow | null> {
   const tokenId = a.market.clobTokenIds[a.outcomeIndex];
@@ -367,8 +385,12 @@ export async function openGuarded(
     return null;
   }
   // 1) Дубли: проверка в БД, а не по «снимку» массива в памяти
-  if (ctx.open.some((p) => p.conditionId === a.market.conditionId) || (await alreadyHeld(ctx.mode, a.market.conditionId))) {
-    await ctx.log("info", `   ⏭️ рынок уже в портфеле: ${short(a.market.question, 40)}`);
+  const isDuplicate = a.allowMultiLeg
+    ? ctx.open.some((p) => p.tokenId === tokenId) || (await alreadyHeld(ctx.mode, a.market.conditionId, tokenId))
+    : ctx.open.some((p) => p.conditionId === a.market.conditionId) || (await alreadyHeld(ctx.mode, a.market.conditionId));
+
+  if (isDuplicate) {
+    await ctx.log("info", `   ⏭️ рынок/исход уже в портфеле: ${short(a.market.question, 40)}`);
     return null;
   }
   // 2) Общий лимит позиций — из БД
@@ -432,7 +454,11 @@ export async function openGuarded(
     return row;
   } catch (err) {
     // unique index positions_one_open_per_token сработал → параллельная вставка; в paper возвращаем деньги
-    await creditCash(ctx.mode, fill.costUsd, 0);
+    if (ctx.mode === "paper") {
+      await creditCash(ctx.mode, fill.costUsd, 0);
+    } else {
+      await ctx.log("error", `🚨 КРИТИЧНО [LIVE]: Ордер ${fill.orderId ?? "N/A"} исполнен на бирже, но запись в БД сорвалась! Деньги НЕ возвращены: ${(err as Error).message}`);
+    }
     await ctx.log("warn", `   ⚠️ Позиция не записана (дубль/ошибка БД): ${(err as Error).message}`);
     return null;
   }
@@ -460,7 +486,6 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
     const recent = trades.filter((t) => now - t.timestamp <= strategy.maxTradeAgeMin * 60);
     const seen = await loadSeenHashes(recent.map(tradeHash));
     const newTrades = recent.filter((t) => !seen.has(tradeHash(t)));
-    await markSeen(newTrades.map((t) => ({ hash: tradeHash(t), whaleId: whale.id })));
     await observeWhaleTrades(ctx.settings, whale, newTrades, (m) => void ctx.log("info", `   ${m}`));
 
     if (!newTrades.length) {
@@ -469,9 +494,14 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
     }
     await ctx.log("info", `   новых сделок: ${newTrades.length}`);
 
+    const markDone = async (t: WhaleTrade) => {
+      await markSeen([{ hash: tradeHash(t), whaleId: whale.id }]);
+    };
+
     // Копирование продаж
     if (strategy.copySells) {
       for (const t of newTrades.filter((x) => x.side === "SELL")) {
+        await markDone(t);
         const match = ctx.open.find((p) => p.whaleAddress.toLowerCase() === whale.address.toLowerCase() && p.conditionId === t.conditionId && p.tokenId === t.asset);
         if (match) {
           const mid = (await ctx.api.fetchMidPrice(match.tokenId)) ?? t.price; // продаём по РЫНКУ, а не по цене кита 30 мин назад
@@ -503,24 +533,27 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
     }
 
     const skipped: Record<string, number> = {};
-    const skip = (r: string) => (skipped[r] = (skipped[r] ?? 0) + 1);
+    const skip = (r: string, t?: WhaleTrade) => {
+      skipped[r] = (skipped[r] ?? 0) + 1;
+      if (t) void markDone(t);
+    };
     let copied = 0;
     const seenThisCycle = new Set<string>(); // одна и та же сделка кита, продублированная в /trades, не копируется дважды
 
     for (const t of newTrades) {
       if (copied >= strategy.maxCopiesPerCycle) break;
       if (ctx.open.length >= ctx.settings.maxOpenPositions) break;
-      if (t.side !== "BUY") { skip("SELL"); continue; }
-      if (seenThisCycle.has(t.conditionId)) { skip("дубль сделки кита"); continue; }
-      if ((sidesByMarket.get(t.conditionId)?.size ?? 0) > 1) { skip("кит купил обе стороны (хедж/ММ)"); continue; }
-      if (ctx.open.some((p) => p.conditionId === t.conditionId)) { skip("рынок уже в портфеле"); continue; }
+      if (t.side !== "BUY") { skip("SELL", t); continue; }
+      if (seenThisCycle.has(t.conditionId)) { skip("дубль сделки кита", t); continue; }
+      if ((sidesByMarket.get(t.conditionId)?.size ?? 0) > 1) { skip("кит купил обе стороны (хедж/ММ)", t); continue; }
+      if (ctx.open.some((p) => p.conditionId === t.conditionId)) { skip("рынок уже в портфеле", t); continue; }
       const price = t.price;
-      if (price > strategy.maxEntryPrice) { skip(`цена > ${cents(strategy.maxEntryPrice)}`); continue; }
-      if (price < strategy.minEntryPrice) { skip(`цена < ${cents(strategy.minEntryPrice)}`); continue; }
+      if (price > strategy.maxEntryPrice) { skip(`цена > ${cents(strategy.maxEntryPrice)}`, t); continue; }
+      if (price < strategy.minEntryPrice) { skip(`цена < ${cents(strategy.minEntryPrice)}`, t); continue; }
       const whaleUsd = t.size * price;
-      if (whaleUsd < strategy.minWhaleTradeUsd) { skip(`сделка кита < ${usd(strategy.minWhaleTradeUsd)}`); continue; }
+      if (whaleUsd < strategy.minWhaleTradeUsd) { skip(`сделка кита < ${usd(strategy.minWhaleTradeUsd)}`, t); continue; }
       const kw = keywordsOk(t.title, strategy);
-      if (kw) { skip(kw); continue; }
+      if (kw) { skip(kw, t); continue; }
 
       await ctx.log("info", `   🎯 Кандидат: ${short(t.title, 40)} [${t.outcome}] ${cents(price)} (кит: ${usd(whaleUsd)})`);
       const market = await ctx.api.fetchMarket(t.conditionId);
@@ -557,7 +590,13 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
         });
         await ctx.log(pass ? "info" : "warn", `   🤖 ИИ: ${aiDecision.decision} (conf ${(aiDecision.confidence * 100).toFixed(0)}%, ×${aiDecision.sizeMultiplier.toFixed(2)}) — ${aiDecision.reason}`);
         if (!pass) continue;
-        bet = Math.min(Math.round(bet * aiDecision.sizeMultiplier * 100) / 100, strategy.maxBetUsd);
+        const mult = Math.max(0.25, Math.min(2.0, aiDecision.sizeMultiplier || 1));
+        bet = Math.min(
+          Math.round(bet * mult * 100) / 100,
+          strategy.maxBetUsd,
+          ctx.portfolio.cashUsd * strategy.maxBetPct,
+          ctx.portfolio.cashUsd
+        );
       }
       if (exposure + bet > budget) { await ctx.log("info", `   ⏭️ ставка ${usd(bet)} превысит лимит категории`); continue; }
 
@@ -567,6 +606,7 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
         aiDecision: aiDecision ? { ...aiDecision, raw: undefined } : null,
       });
       if (!row) continue;
+      await markDone(t);
       seenThisCycle.add(t.conditionId);
       exposure += row.costUsd;
       copied++;
@@ -666,10 +706,14 @@ export function calcBet(s: Strategy, price: number, cashUsd: number, whaleUsd: n
       const p = Math.min(0.99, Math.max(0.01, price + s.assumedEdge));
       const b = (1 - price) / price; // выигрыш на $1 ставки
       const f = (p * b - (1 - p)) / b; // полный Kelly
-      bet = Math.max(0, f) * s.kellyMultiplier * cashUsd;
-      if (f <= 0) log(`Kelly ≤ 0 при цене ${cents(price)} и edge ${s.assumedEdge} — ставка минимальная`);
+      if (f <= 0) {
+        log(`Kelly ≤ 0 (f=${f.toFixed(3)}) при цене ${cents(price)} и edge ${s.assumedEdge} — отказ от ставки`);
+        return 0;
+      }
+      bet = f * s.kellyMultiplier * cashUsd;
     }
   }
+  if (bet <= 0) return 0;
   bet = Math.max(cashUsd * s.minBetPct, Math.min(bet, cashUsd * s.maxBetPct));
   bet = Math.min(bet, s.maxBetUsd, cashUsd);
   return Math.floor(bet * 100) / 100;

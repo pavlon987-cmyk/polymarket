@@ -87,6 +87,40 @@ export function normalizeMarket(m: Record<string, unknown>): MarketInfo {
   };
 }
 
+export function normalizeClobMarket(m: Record<string, unknown>): MarketInfo {
+  const rawTokens = Array.isArray(m.tokens) ? (m.tokens as Record<string, unknown>[]) : [];
+  const tokens = rawTokens.map((t) => ({
+    tokenId: String(t.token_id ?? ""),
+    outcome: String(t.outcome ?? ""),
+    price: Number(t.price ?? 0),
+    winner: t.winner !== undefined ? Boolean(t.winner) : undefined,
+  }));
+  const outcomes = tokens.map((t) => t.outcome);
+  const outcomePrices = tokens.map((t) => t.price);
+  const clobTokenIds = tokens.map((t) => t.tokenId);
+  const hasWinner = tokens.some((t) => t.winner === true);
+  return {
+    conditionId: String(m.condition_id ?? ""),
+    question: String(m.question ?? "Unknown Market"),
+    slug: String(m.market_slug ?? ""),
+    outcomes,
+    outcomePrices,
+    clobTokenIds,
+    volumeUsd: 0,
+    liquidityUsd: 0,
+    closed: Boolean(m.closed),
+    active: Boolean(m.active),
+    acceptingOrders: Boolean(m.accepting_orders),
+    umaResolutionStatus: hasWinner ? "resolved" : null,
+    endDate: (m.end_date_iso as string | undefined) ?? null,
+    closedTime: null,
+    bestBid: null,
+    bestAsk: null,
+    eventSlug: "",
+    tokens,
+  };
+}
+
 export function normalizeTrade(t: unknown): WhaleTrade {
   const x = t as Record<string, unknown>;
   const idx = Number(x.outcomeIndex);
@@ -191,7 +225,14 @@ export class PolymarketClient {
     if (c && Date.now() - c.at < maxAgeMs) return c.m;
     const data = await this.fetchJson<Record<string, unknown>[]>(`${this.gammaApi}/markets?condition_ids=${conditionId}`);
     const raw = Array.isArray(data) ? data[0] : null;
-    const m = raw && String(raw.conditionId ?? "").toLowerCase() === conditionId.toLowerCase() ? normalizeMarket(raw) : null;
+    let m = raw && String(raw.conditionId ?? "").toLowerCase() === conditionId.toLowerCase() ? normalizeMarket(raw) : null;
+    if (!m) {
+      // Фолбэк на CLOB API: архивные и короткие 5-15m рынки исчезают из gamma, но есть в CLOB
+      const clobRaw = await this.fetchJson<Record<string, unknown>>(`${this.clobApi}/markets/${conditionId}`);
+      if (clobRaw && String(clobRaw.condition_id ?? "").toLowerCase() === conditionId.toLowerCase()) {
+        m = normalizeClobMarket(clobRaw);
+      }
+    }
     this.marketCache.set(conditionId, { at: Date.now(), m });
     return m;
   }

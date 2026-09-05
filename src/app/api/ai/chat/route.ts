@@ -45,7 +45,9 @@ export async function POST(req: Request) {
   const message = (body.message ?? "").trim();
   if (!message) return Response.json({ error: "message required" }, { status: 400 });
   const settings = await getSettings();
-  const mode: TradingMode = body.mode === "live" ? "live" : (settings.tradingMode as TradingMode) === "live" ? "live" : "paper";
+  const mode: TradingMode = (body.mode === "live" || body.mode === "paper")
+    ? body.mode
+    : (settings.tradingMode === "live" ? "live" : "paper");
 
   await addChatMessage("user", message);
   const history = await getChatHistory(40);

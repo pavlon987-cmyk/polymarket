@@ -1,6 +1,7 @@
 import { runCycle, isCycleRunning } from "./engine";
 import { addLog, getSettings, updateSettings } from "./store";
 import type { CycleResult } from "./types";
+import { startRiskWorker, stopRiskWorker } from "./risk-worker";
 
 type RunnerState = {
   running: boolean;
@@ -56,6 +57,7 @@ export async function startLoop(persist = true, initialDelayMs = 0) {
   s.nextRunAt = new Date(Date.now() + initialDelayMs).toISOString();
   if (persist) await updateSettings({ autorun: true });
   await addLog("info", "🟢 Авто-цикл запущен");
+  startRiskWorker();
   s.timer = setTimeout(() => void tick(), initialDelayMs);
   s.timer.unref?.();
   return getRunnerState();
@@ -67,6 +69,7 @@ export async function stopLoop(persist = true) {
   s.timer = null;
   s.running = false;
   s.nextRunAt = null;
+  stopRiskWorker();
   if (persist) await updateSettings({ autorun: false });
   await addLog("info", "⏹ Авто-цикл остановлен");
   return getRunnerState();

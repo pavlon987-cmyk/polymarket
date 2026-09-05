@@ -6,6 +6,7 @@ import {
   aiChatMessages,
   aiDecisions,
   botLogs,
+  cashAdjustments,
   marketSnapshots,
   portfolios,
   positions,
@@ -155,8 +156,11 @@ export async function resetPortfolio(mode: TradingMode): Promise<void> {
   await db.delete(positions).where(eq(positions.mode, mode));
   await db.delete(aiDecisions).where(eq(aiDecisions.mode, mode));
   await db.delete(portfolios).where(eq(portfolios.mode, mode));
-  await db.delete(seenTrades);
-  await addLog("warn", `Портфель ${mode} сброшен`);
+  await db.delete(cashAdjustments).where(eq(cashAdjustments.mode, mode));
+  if (mode === "paper") {
+    await db.delete(seenTrades);
+  }
+  await addLog("warn", `Портфель ${mode} сброшен (позиции, решения, корректировки кэша)`);
 }
 
 /** Импорт portfolio_improved.json из старого скрипта (один раз, если файл есть в cwd) */

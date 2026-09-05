@@ -37,6 +37,9 @@ const posView = (p: PositionRow) => ({
 async function makeCtx(mode: TradingMode): Promise<Ctx> {
   const settings = await getSettings();
   const { executor } = createExecutor({ ...settings, tradingMode: mode }, (m) => void addLog("info", m));
+  if (mode === "live" && executor.mode !== "live") {
+    throw new Error("Live-режим не готов: проверьте приватный ключ, RPC и настройки LIVE в интерфейсе.");
+  }
   const api = new PolymarketClient({ settings, log: (m) => void addLog("info", m) });
   const ledger = await reconcilePortfolio(mode, { log: false });
   const portfolio = await getPortfolio(mode, settings);
@@ -85,7 +88,14 @@ tool("price_history", "История цены токена (interval: 1h|6h|1d|
   new PolymarketClient({ settings: await getSettings() }).fetchPriceHistory(str(a.tokenId), (str(a.interval, "1d") as "1d")), { required: ["tokenId"] });
 tool("get_logs", "Последние строки журнала бота.", { limit: { type: "number" }, level: { type: "string" } }, async (a) => (await getLogs(num(a.limit, 60))).filter((l) => !a.level || l.level === a.level));
 tool("recent_ai_decisions", "Последние решения ИИ по копированию.", { limit: { type: "number" } }, async (a, mode) => recentAiDecisions(mode, num(a.limit, 20)));
-tool("get_settings", "Текущие настройки бота (без секретов).", {}, async () => { const s = await getSettings(); return { ...s, aiApiKey: s.aiApiKey ? "***" : "", telegramToken: undefined }; });
+tool("get_settings", "Текущие настройки бота (без секретов).", {}, async () => {
+  const s = await getSettings();
+  return {
+    ...s,
+    aiApiKey: s.aiApiKey ? "***" : "",
+    telegramBotToken: s.telegramBotToken ? "***" : "",
+  };
+});
 tool("list_strategies", "Стратегии библиотеки, их параметры и статус.", {}, async () => ({ defs: STRATEGIES.map((d) => ({ id: d.id, name: d.name, description: d.description, needsAi: d.needsAi })), configs: await selectStrategyConfigs() }));
 tool("get_runner", "Состояние авто-цикла: запущен ли, когда следующий, последний результат.", {}, async () => getRunnerState());
 tool("recall_memory", "Долговременная память Васи по теме (кит/категория/стратегия).", { topic: { type: "string" } }, async (a) => ({ block: await buildMemoryBlock({ whaleName: str(a.topic) || undefined }, 3000), stats: await memoryStats() }));
@@ -101,7 +111,10 @@ tool("set_strategy", "Включить/выключить стратегию и�
 }, async (a) => saveStrategyConfig(str(a.id), { enabled: a.enabled as boolean | undefined, maxBetUsd: a.maxBetUsd as number | undefined, maxPositions: a.maxPositions as number | undefined, params: a.params as Record<string, unknown> | undefined }), { required: ["id"] });
 tool("update_settings", "Изменить настройки бота: maxOpenPositions, minHoursToEnd, maxDaysToEnd, stopLossPercent, checkIntervalSec, aiMinConfidence, aiAutoCut, aiAutoHedge, defaultStrategy{...} и др.", { patch: { type: "object" } }, async (a) => {
   const patch = (a.patch ?? {}) as Record<string, unknown>;
-  delete patch.aiApiKey; delete patch.tradingMode; delete patch.liveArmed; // режим и ключи — только руками в UI
+  delete patch.aiApiKey;
+  delete patch.telegramBotToken;
+  delete patch.tradingMode;
+  delete patch.liveArmed; // режим и ключи — только руками в UI
   return updateSettings(patch);
 }, { required: ["patch"] });
 tool("add_whale", "Добавить кошелёк в отслеживание.", { address: { type: "string" }, name: { type: "string" }, category: { type: "string" }, notes: { type: "string" } }, async (a) =>

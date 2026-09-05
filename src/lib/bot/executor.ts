@@ -37,7 +37,11 @@ export class PaperExecutor implements Executor {
   async sell({ tokenId, shares, price }: { tokenId: string; shares: number; price: number; market: string }): Promise<SellResult> {
     const est = await this.api.estimateFill(tokenId, "SELL", shares);
     const avg = est?.avgPrice ?? price;
-    const proceeds = shares * avg * (1 - this.feeBps / 10_000);
+    if (est && est.filled < shares * 0.1) {
+      return { ok: false, proceedsUsd: 0, avgPrice: avg, error: `в стакане на покупку нет достаточной ликвидности (${est.filled.toFixed(2)} из ${shares.toFixed(2)})` };
+    }
+    const filledShares = est ? Math.min(shares, est.filled) : shares;
+    const proceeds = filledShares * avg * (1 - this.feeBps / 10_000);
     return { ok: true, proceedsUsd: proceeds, avgPrice: avg };
   }
   async balanceUsd() { return null; }
@@ -111,12 +115,12 @@ export class LiveExecutor implements Executor {
       const order = await client.createMarketOrder({ side: this.mod.Side.SELL, tokenID: tokenId, amount: size, price: limitPx });
       let resp = await client.postOrder(order, this.mod.OrderType.FOK);
       if (!resp?.success) {
-        // Фолбэк: GTC-лимит по best bid — уйдёт частями, но уйдёт
+        // Фолбэк: GTC-лимит по best bid — ордер встаёт в стакан, ждёт исполнения через WS/fill
         const lim = await client.createOrder({ side: this.mod.Side.SELL, tokenID: tokenId, size, price: limitPx });
         resp = await client.postOrder(lim, this.mod.OrderType.GTC);
         if (!resp?.success) return { ok: false, proceedsUsd: 0, avgPrice: price, error: resp?.errorMsg || JSON.stringify(resp) };
-        this.log(`📤 LIVE SELL (GTC-лимит ${limitPx}) ${market.slice(0, 40)} — ${size} шт. (order ${resp.orderID})`);
-        return { ok: true, proceedsUsd: size * limitPx, avgPrice: limitPx, orderId: String(resp.orderID ?? "") };
+        this.log(`📤 LIVE SELL: FOK отклонён, GTC-лимит ${limitPx} выставлен в стакан для ${market.slice(0, 35)} (order ${resp.orderID})`);
+        return { ok: false, proceedsUsd: 0, avgPrice: limitPx, orderId: String(resp.orderID ?? ""), error: "GTC-лимит размещён в стакане, ожидаем исполнения" };
       }
       const proceeds = Number(resp.takingAmount ?? size * price); // при SELL получаем USDC = takingAmount
       const avg = proceeds / size;

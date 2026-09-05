@@ -122,6 +122,7 @@ export type MarketInfo = {
   bestBid?: number | null;
   bestAsk?: number | null;
   eventSlug?: string;
+  tokens?: { tokenId: string; outcome: string; price: number; winner?: boolean }[];
 };
 
 export type CycleResult = {

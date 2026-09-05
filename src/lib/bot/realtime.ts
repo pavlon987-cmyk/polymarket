@@ -18,9 +18,18 @@ import { and, eq } from "drizzle-orm";
 
 type WsLike = { send(d: string): void; close(): void; readyState: number; on(ev: string, cb: (...a: unknown[]) => void): void };
 
+export type ExecutableQuote = {
+  tokenId: string;
+  bestBid: number | null;
+  bestAsk: number | null;
+  mid: number | null;
+  receivedAtMs: number;
+};
+
 export type RealtimeEvent =
   | { type: "price"; data: { tokenId: string; price: number; positionId?: number } }
   | { type: "book"; data: { tokenId: string; bestBid: number; bestAsk: number; spread: number } }
+  | { type: "quote"; data: ExecutableQuote }
   | { type: "position"; data: { action: "opened" | "closed"; position: unknown } }
   | { type: "cycle"; data: unknown }
   | { type: "fill"; data: unknown }
@@ -34,6 +43,7 @@ class Realtime extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private lastPrices = new Map<string, number>();
+  private quotes = new Map<string, ExecutableQuote>();
   public wsUrl = process.env.POLYMARKET_WS_URL ?? "wss://ws-subscriptions-clob.polymarket.com/ws";
 
   publish<T extends RealtimeEvent["type"]>(type: T, data: Extract<RealtimeEvent, { type: T }>["data"]) {
@@ -42,6 +52,14 @@ class Realtime extends EventEmitter {
 
   price(tokenId: string) {
     return this.lastPrices.get(tokenId) ?? null;
+  }
+
+  quote(tokenId: string): ExecutableQuote | null {
+    return this.quotes.get(tokenId) ?? null;
+  }
+
+  bestBid(tokenId: string): number | null {
+    return this.quotes.get(tokenId)?.bestBid ?? this.lastPrices.get(tokenId) ?? null;
   }
 
   /** Подписаться на токен (вызывается при открытии позиции и при старте) */
@@ -103,36 +121,62 @@ class Realtime extends EventEmitter {
         if (bestBid > 0 && bestAsk < 1) {
           const mid = (bestBid + bestAsk) / 2;
           this.lastPrices.set(tokenId, mid);
+          const q: ExecutableQuote = { tokenId, bestBid, bestAsk, mid, receivedAtMs: Date.now() };
+          this.quotes.set(tokenId, q);
           this.publish("book", { tokenId, bestBid, bestAsk, spread: bestAsk - bestBid });
           this.publish("price", { tokenId, price: mid });
+          this.publish("quote", q);
           void this.persistPrice(tokenId, mid);
         }
-      } else if (ev.event_type === "price_change" && Array.isArray(ev.changes)) {
-        for (const c of ev.changes as { asset_id: string; price: string; best_bid?: string; best_ask?: string }[]) {
+      } else if (ev.event_type === "price_change") {
+        const changes = (Array.isArray(ev.price_changes) ? ev.price_changes : Array.isArray(ev.changes) ? ev.changes : []) as { asset_id: string; price: string; best_bid?: string; best_ask?: string }[];
+        for (const c of changes) {
           const bb = Number(c.best_bid), ba = Number(c.best_ask);
-          const mid = Number.isFinite(bb) && Number.isFinite(ba) && bb > 0 ? (bb + ba) / 2 : Number(c.price);
+          const hasBb = Number.isFinite(bb) && bb > 0;
+          const hasBa = Number.isFinite(ba) && ba > 0;
+          const mid = hasBb && hasBa ? (bb + ba) / 2 : Number(c.price);
           if (!Number.isFinite(mid)) continue;
           this.lastPrices.set(c.asset_id, mid);
+          const q: ExecutableQuote = {
+            tokenId: c.asset_id,
+            bestBid: hasBb ? bb : null,
+            bestAsk: hasBa ? ba : null,
+            mid,
+            receivedAtMs: Date.now(),
+          };
+          this.quotes.set(c.asset_id, q);
           this.publish("price", { tokenId: c.asset_id, price: mid });
+          this.publish("quote", q);
           void this.persistPrice(c.asset_id, mid);
         }
       } else if (ev.event_type === "last_trade_price") {
         const p = Number(ev.price);
         if (Number.isFinite(p)) {
           this.lastPrices.set(tokenId, p);
+          const cur = this.quotes.get(tokenId);
+          const q: ExecutableQuote = {
+            tokenId,
+            bestBid: cur?.bestBid ?? p,
+            bestAsk: cur?.bestAsk ?? null,
+            mid: p,
+            receivedAtMs: Date.now(),
+          };
+          this.quotes.set(tokenId, q);
           this.publish("price", { tokenId, price: p });
+          this.publish("quote", q);
         }
       }
     }
   }
 
   private persistTimers = new Map<string, NodeJS.Timeout>();
-  /** lastPrice в БД обновляем не чаще раза в 3 с на токен (дебаунс) */
-  private persistPrice(tokenId: string, price: number) {
+  /** lastPrice в БД обновляем не чаще раза в 3 с на токен (дебаунс), записывая САМУЮ СВЕЖУЮ цену */
+  private persistPrice(tokenId: string, fallbackPrice: number) {
     if (this.persistTimers.has(tokenId)) return;
     const t = setTimeout(async () => {
       this.persistTimers.delete(tokenId);
-      await db.update(positions).set({ lastPrice: price, updatedAt: new Date() }).where(and(eq(positions.tokenId, tokenId), eq(positions.status, "OPEN"))).catch(() => {});
+      const latest = this.lastPrices.get(tokenId) ?? fallbackPrice;
+      await db.update(positions).set({ lastPrice: latest, updatedAt: new Date() }).where(and(eq(positions.tokenId, tokenId), eq(positions.status, "OPEN"))).catch(() => {});
     }, 3_000);
     t.unref?.();
     this.persistTimers.set(tokenId, t);
