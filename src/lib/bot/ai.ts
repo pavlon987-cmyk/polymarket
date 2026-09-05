@@ -4,6 +4,17 @@ import type { ToolDef } from "./tools";
 
 export type AiSettings = Pick<Settings, "aiApiUrl" | "aiApiKey" | "aiModel" | "aiSystemPrompt" | "aiTemperature" | "aiTimeoutMs">;
 
+/** Нормализуем URL: можно указать базу (…/v1) или полный путь до chat/completions */
+export function resolveChatUrl(url: string): string {
+  const u = url.trim().replace(/\/$/, "");
+  if (/\/chat\/completions$/.test(u)) return u;
+  if (/\/v1\/?$/.test(u)) return `${u}/chat/completions`;
+  if (/\/api\/?$/.test(u)) return `${u}/chat/completions`;
+  if (/\/v1\//.test(u)) return u.replace(/\/v1\/.*$/, "/v1/chat/completions");
+  if (u.includes("/v1")) return `${u}/chat/completions`;
+  return `${u}/v1/chat/completions`;
+}
+
 export type ChatMsg =
   | { role: "system" | "user"; content: string }
   | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
@@ -35,7 +46,7 @@ export async function chatCompletion(
       body.tool_choice = opts.toolChoice ?? "auto";
     }
     if (opts.jsonMode) body.response_format = { type: "json_object" };
-    const res = await fetch(s.aiApiUrl, {
+    const res = await fetch(resolveChatUrl(s.aiApiUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(s.aiApiKey ? { Authorization: `Bearer ${s.aiApiKey}` } : {}), "HTTP-Referer": "https://github.com/pavlon987-cmyk/polymarket", "X-Title": "Polymarket Copy-Trader" },
       body: JSON.stringify(body),

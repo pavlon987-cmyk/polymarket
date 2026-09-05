@@ -17,7 +17,7 @@ type Check = {
   recent: { side: string; title: string; outcome: string; price: number; usd: number; at: string }[];
   messages: string[];
 };
-type Candidate = { wallet: string; name: string; trades: number; volumeUsd: number; markets: string[]; buyRatio: number; avgPrice: number };
+type Candidate = { address: string; name: string; trades: number; volumeUsd: number; markets: string[]; buyRatio: number; avgPrice: number };
 type Score = { address: string; name: string; score: number; totalTrades: number; winRate: number; totalVolumeUsd: number; avgPrice: number; maxDrawdownPct: number; verified: boolean; category: string; notes: string[] };
 type VerifiedRow = { id: number; address: string; name: string; score: number; totalTrades: number; winRate: number; totalVolumeUsd: number; avgPrice: number; verified: boolean; category: string; notes: string; updatedAt: string };
 
@@ -374,12 +374,12 @@ export function WhalesManager() {
               minWidth={900}
               head={["Трейдер", "Адрес", "Сделок", "Объём", "BUY %", "Ср. цена", "Примеры рынков", "Оценка", ""]}
               rows={cands.map((c) => {
-                const isKnown = known.has(c.wallet.toLowerCase());
+                const isKnown = known.has(c.address.toLowerCase());
                 return [
                   <span key="n" className="font-medium text-slate-200">{c.name || "—"}</span>,
                   <span key="a" className="flex items-center gap-1 font-mono text-xs text-slate-400">
-                    {shortAddr(c.wallet)}
-                    <button onClick={() => copy(c.wallet)} className="text-slate-600 hover:text-slate-200">⧉</button>
+                    {shortAddr(c.address)}
+                    <button onClick={() => copy(c.address)} className="text-slate-600 hover:text-slate-200">⧉</button>
                   </span>,
                   c.trades,
                   usd(c.volumeUsd),
@@ -387,12 +387,12 @@ export function WhalesManager() {
                   cents(c.avgPrice),
                   <span key="m" className="block max-w-[260px] truncate text-xs text-slate-400" title={c.markets.join("\n")}>{c.markets.join(" · ")}</span>,
                   <span key="s">
-                    {scores[c.wallet.toLowerCase()] ? scoreBadge(scores[c.wallet.toLowerCase()]) : <Btn size="sm" variant="ghost" onClick={() => verify(c.wallet)}>🔍</Btn>}
+                    {scores[c.address.toLowerCase()] ? scoreBadge(scores[c.address.toLowerCase()]) : <Btn size="sm" variant="ghost" onClick={() => verify(c.address)}>🔍</Btn>}
                   </span>,
                   isKnown ? (
                     <Badge key="k" tone="green">уже добавлен</Badge>
                   ) : (
-                    <Btn key="add" size="sm" onClick={() => add({ address: c.wallet, name: c.name || `Trader ${c.wallet.slice(0, 8)}`, category: "Other", notes: `из поиска: ${c.trades} сделок, объём ${usd(c.volumeUsd)}` }, false)} disabled={adding} title="Добавится выключенным — включи после проверки">
+                    <Btn key="add" size="sm" onClick={() => add({ address: c.address, name: c.name || `Trader ${c.address.slice(0, 8)}`, category: "Other", notes: `из поиска: ${c.trades} сделок, объём ${usd(c.volumeUsd)}` }, false)} disabled={adding} title="Добавится выключенным — включи после проверки">
                       ➕ добавить
                     </Btn>
                   ),
