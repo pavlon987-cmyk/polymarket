@@ -362,9 +362,16 @@ export function Dashboard() {
               const pnl = unreal(x);
               return [
                 <div key="m" className="max-w-[320px]">
-                  <div className="truncate font-medium text-slate-200" title={x.market}>
-                    {x.market}
-                  </div>
+                  <a
+                    href={`https://polymarket.com/search?q=${encodeURIComponent(x.market)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="truncate font-medium text-slate-200 hover:text-indigo-400 hover:underline flex items-center gap-1"
+                    title={`Открыть на Polymarket: ${x.market}`}
+                  >
+                    <span className="truncate">{x.market}</span>
+                    <span className="shrink-0 text-xs text-indigo-400">↗</span>
+                  </a>
                   {x.aiDecision?.reason && (
                     <div className="truncate text-[11px] text-slate-500" title={x.aiDecision.reason}>
                       🤖 {x.aiDecision.reason}
@@ -456,7 +463,17 @@ export function Dashboard() {
             minWidth={860}
             head={["Рынок", "Исход", "Вход", "Статус", "Ставка", "P&L", "Причина", "Источник", "Закрыта"]}
             rows={closedShown.map((x) => [
-              <div key="m" className="max-w-[300px] truncate text-slate-200" title={x.market}>{x.market}</div>,
+              <a
+                key="m"
+                href={`https://polymarket.com/search?q=${encodeURIComponent(x.market)}`}
+                target="_blank"
+                rel="noreferrer"
+                className="max-w-[300px] truncate font-medium text-slate-200 hover:text-indigo-400 hover:underline inline-flex items-center gap-1"
+                title={`Открыть на Polymarket: ${x.market}`}
+              >
+                <span className="truncate">{x.market}</span>
+                <span className="shrink-0 text-xs text-indigo-400">↗</span>
+              </a>,
               <Badge key="o" tone="sky">{x.outcome}</Badge>,
               cents(x.price),
               <Badge key="s" tone={statusTone(x.status)}>{x.status}</Badge>,
