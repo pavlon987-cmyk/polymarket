@@ -1,7 +1,9 @@
 import type { PortfolioRow, PositionRow, Settings, StrategyConfigRow, Whale } from "@/db/schema";
 import { chatCompletion } from "./ai";
 import { detectCryptoMarket, getCryptoPrice } from "./crypto";
+import { openGuarded } from "./engine";
 import { createExecutor, type Executor } from "./executor";
+import { alreadyHeld } from "./ledger";
 import { buildMemoryBlock, remember, rememberStrategyResult } from "./memory";
 import { sendTelegram } from "./notify";
 import { aggregateWhales, PolymarketClient } from "./polymarket";
@@ -10,7 +12,6 @@ import {
   getMarketSnapshots,
   getPortfolio,
   getSettings,
-  insertPosition,
   listWhales,
   openPositions,
   saveMarketSnapshot,
@@ -62,71 +63,37 @@ function res(): StrategyResult {
 const held = (ctx: StrategyBase) => new Set(ctx.open.map((p) => p.conditionId));
 const mineOpen = (ctx: StrategyContext) => ctx.open.filter((p) => p.source === ctx.cfg.id).length;
 
-function canOpen(ctx: StrategyContext): string | null {
+export async function canOpen(ctx: StrategyContext, conditionId?: string): Promise<string | null> {
   if (ctx.portfolio.halted) return "портфель остановлен стоп-лоссом";
   if (ctx.open.length >= ctx.settings.maxOpenPositions) return `общий лимит позиций ${ctx.settings.maxOpenPositions}`;
   if (mineOpen(ctx) >= ctx.cfg.maxPositions) return `лимит стратегии ${ctx.cfg.maxPositions}`;
   if (ctx.portfolio.cashUsd < 1) return "нет кэша";
+  if (conditionId && (await alreadyHeld(ctx.mode, conditionId))) return "рынок уже в портфеле (БД)";
   return null;
 }
 
-async function openPosition(
+export async function openPosition(
   ctx: StrategyContext,
-  a: {
-    market: MarketInfo;
-    outcomeIndex: number;
-    price: number;
-    usd: number;
-    reason: string;
-    confidence?: number;
-    label?: string;
-  }
+  a: { market: MarketInfo; outcomeIndex: number; price: number; usd: number; reason: string; confidence?: number; label?: string }
 ): Promise<PositionRow | null> {
   const def = STRATEGIES.find((d) => d.id === ctx.cfg.id)!;
-  const tokenId = a.market.clobTokenIds[a.outcomeIndex];
-  const outcome = a.market.outcomes[a.outcomeIndex];
-  if (!tokenId || !outcome || a.price <= 0) return null;
-  const bet = Math.round(Math.min(a.usd, ctx.cfg.maxBetUsd, ctx.portfolio.cashUsd) * 100) / 100;
-  if (bet < 1) {
-    ctx.log(`   ⏭️ ставка < $1 (${usd(bet)})`);
-    return null;
-  }
-  const fill = await ctx.executor.buy({ tokenId, price: a.price, usd: bet, market: a.market.question });
-  if (!fill.ok) {
-    ctx.log(`   ⚠️ ордер не исполнен: ${fill.error}`);
-    return null;
-  }
-  const row = await insertPosition({
-    mode: ctx.mode,
-    whaleId: null,
-    whaleName: a.label ?? `🧠 ${def.emoji} ${def.name}`,
-    whaleAddress: "",
-    source: ctx.cfg.id,
-    category: def.id === "crypto_threshold" ? "Crypto" : `S:${def.id}`,
-    conditionId: a.market.conditionId,
-    tokenId,
-    market: a.market.question,
-    outcome,
-    outcomeIndex: a.outcomeIndex,
-    price: fill.avgPrice,
-    lastPrice: fill.avgPrice,
-    shares: fill.shares,
-    costUsd: fill.costUsd,
-    aiDecision: { decision: "COPY", confidence: a.confidence ?? 0.5, sizeMultiplier: 1, reason: a.reason },
-    liveOrderId: fill.orderId ?? null,
-  });
-  ctx.open.push(row);
-  ctx.portfolio.cashUsd -= fill.costUsd;
-  ctx.portfolio.totalInvestedUsd += fill.costUsd;
-  await savePortfolio(ctx.portfolio);
-  ctx.log(
-    `   ✅ ${def.emoji} ${short(a.market.question)} — ${outcome} @ ${cents(fill.avgPrice)} · ${usd(fill.costUsd)} → ${fill.shares.toFixed(2)} шт. · ${a.reason}`
+  return openGuarded(
+    {
+      ...ctx,
+      log: async (_lvl, msg) => { ctx.log(msg); },
+    },
+    {
+      market: a.market,
+      outcomeIndex: a.outcomeIndex,
+      price: a.price,
+      usd: Math.min(a.usd, ctx.cfg.maxBetUsd),
+      source: ctx.cfg.id,
+      category: def.id === "crypto_threshold" ? "Crypto" : `S:${def.id}`,
+      label: a.label ?? `🧠 ${def.emoji} ${def.name}`,
+      reason: a.reason,
+      confidence: a.confidence,
+    }
   );
-  await sendTelegram(
-    ctx.settings,
-    `${def.emoji} ${def.name} [${ctx.mode.toUpperCase()}]\n${a.market.question}\n${outcome} @ ${cents(fill.avgPrice)} · ${usd(fill.costUsd)}\n${a.reason}`
-  );
-  return row;
 }
 
 type Pick_ = { idx: number; outcome: string; confidence: number; reason: string; betPct: number };
@@ -162,7 +129,7 @@ async function applyPicks(ctx: StrategyContext, batch: MarketInfo[], picks: Pick
     }
     const idx = m.outcomes.findIndex((o) => o.toLowerCase() === String(d.outcome).toLowerCase());
     if (idx < 0) continue;
-    const gate = canOpen(ctx);
+    const gate = await canOpen(ctx, m.conditionId);
     if (gate) {
       r.notes.push(gate);
       return;
@@ -222,7 +189,7 @@ export const STRATEGIES: StrategyDef[] = [
         const [y, n] = m.outcomePrices;
         const spread = (1 - (y + n)) * 100;
         if (spread < ctx.p("minSpreadPct", 1.5) || h.has(m.conditionId)) continue;
-        const gate = canOpen(ctx);
+        const gate = await canOpen(ctx, m.conditionId);
         if (gate) {
           r.notes.push(gate);
           break;
@@ -293,7 +260,7 @@ export const STRATEGIES: StrategyDef[] = [
         if (idx < 0 || m.outcomes[0]?.toLowerCase() !== "yes") continue;
         const price = m.outcomePrices[idx];
         if (price > ctx.p("maxPrice", 0.85) || price < 0.05) continue;
-        const gate = canOpen(ctx);
+        const gate = await canOpen(ctx, m.conditionId);
         if (gate) {
           r.notes.push(gate);
           break;
@@ -334,7 +301,10 @@ export const STRATEGIES: StrategyDef[] = [
         const idx = m.outcomePrices.indexOf(Math.max(...m.outcomePrices));
         const price = m.outcomePrices[idx];
         if (price < ctx.p("minPrice", 0.88) || price > ctx.p("maxPrice", 0.97)) continue;
-        const gate = canOpen(ctx);
+        const book = await ctx.api.fetchOrderBook(m.clobTokenIds[idx]);
+        if (!book || book.spread > 0.03 || book.depthUsd < ctx.cfg.maxBetUsd * 3) { r.skipped++; continue; }
+        const askPrice = book.bestAsk || price;
+        const gate = await canOpen(ctx, m.conditionId);
         if (gate) {
           r.notes.push(gate);
           break;
@@ -342,10 +312,10 @@ export const STRATEGIES: StrategyDef[] = [
         const row = await openPosition(ctx, {
           market: m,
           outcomeIndex: idx,
-          price,
+          price: askPrice,
           usd: ctx.cfg.maxBetUsd,
-          confidence: price,
-          reason: `фаворит ${cents(price)}, до конца ${Math.round(hte)}ч, доход ${(((1 - price) / price) * 100).toFixed(1)}%`,
+          confidence: askPrice,
+          reason: `фаворит ${cents(askPrice)}, до конца ${Math.round(hte)}ч, доход ${(((1 - askPrice) / askPrice) * 100).toFixed(1)}%`,
         });
         if (row) {
           r.opened++;
@@ -378,7 +348,7 @@ export const STRATEGIES: StrategyDef[] = [
           if (prev === undefined || !prev) continue;
           const d = price - prev;
           if (d < ctx.p("minMovePts", 0.08) || price < ctx.p("minPrice", 0.3) || price > ctx.p("maxPrice", 0.8)) continue;
-          const gate = canOpen(ctx);
+          const gate = await canOpen(ctx, m.conditionId);
           if (gate) {
             r.notes.push(gate);
             return r;
@@ -441,34 +411,59 @@ export const STRATEGIES: StrategyDef[] = [
     emoji: "🤝",
     needsAi: false,
     description: "Два и более активных кита купили один и тот же исход за последние часы — сигнал сильнее одиночного, ставим отдельно от копирования.",
-    defaults: { maxBetUsd: 15, maxPositions: 4, params: { minWhales: 2, windowHours: 12, maxPrice: 0.7, stopLossPct: 0.3, takeProfitPct: 0.5 } },
-    paramLabels: { minWhales: "Мин. китов", windowHours: "Окно, часов", maxPrice: "Макс. цена" },
+    defaults: { maxBetUsd: 15, maxPositions: 4, params: { minWhales: 2, windowHours: 12, maxPrice: 0.7, minPrice: 0.08, minHours: 2, stopLossPct: 0.3, takeProfitPct: 0.5 } },
+    paramLabels: { minWhales: "Мин. китов", windowHours: "Окно, часов", maxPrice: "Макс. цена", minPrice: "Мин. цена", minHours: "Мин. часов до конца" },
     async run(ctx) {
       const r = res();
       const h = held(ctx);
       const now = Date.now() / 1000;
+      const windowSec = ctx.p("windowHours", 12) * 3600;
       if (!ctx.whaleTrades.size) {
         for (const w of ctx.whales) ctx.whaleTrades.set(w.address, await ctx.api.fetchWhaleTrades(w.address, 40));
       }
-      const agg = new Map<string, { whales: Set<string>; asset: string; prices: number[]; title: string }>();
+
+      // нетто-позиция каждого кита по каждому ТОКЕНУ (BUY − SELL в $)
+      type Agg = { byWhale: Map<string, Map<string, number>>; title: string; lastTs: number };
+      const agg = new Map<string, Agg>();
       for (const [addr, trades] of ctx.whaleTrades) {
         for (const t of trades) {
-          if (t.side !== "BUY" || now - t.timestamp > ctx.p("windowHours", 12) * 3600) continue;
-          const a = agg.get(t.conditionId) ?? { whales: new Set(), asset: t.asset, prices: [], title: t.title };
-          a.whales.add(addr);
-          a.prices.push(t.price);
+          if (now - t.timestamp > windowSec) continue;
+          const a = agg.get(t.conditionId) ?? { byWhale: new Map(), title: t.title, lastTs: 0 };
+          const w = a.byWhale.get(addr) ?? new Map<string, number>();
+          w.set(t.asset, (w.get(t.asset) ?? 0) + (t.side === "BUY" ? 1 : -1) * t.size * t.price);
+          a.byWhale.set(addr, w);
+          a.lastTs = Math.max(a.lastTs, t.timestamp);
           agg.set(t.conditionId, a);
         }
       }
-      const hits = [...agg.entries()].filter(([cid, a]) => a.whales.size >= ctx.p("minWhales", 2) && !h.has(cid));
+      const hits: { cid: string; asset: string; whales: number; title: string }[] = [];
+      for (const [cid, a] of agg) {
+        if (h.has(cid)) continue;
+        const votes = new Map<string, number>();
+        for (const [, byAsset] of a.byWhale) {
+          // кит «голосует» только если нетто-лонг ровно на одном исходе и он ≥ $5; купил обе стороны → не голосует
+          const longs = [...byAsset.entries()].filter(([, usd]) => usd >= 5);
+          if (longs.length !== 1) continue;
+          votes.set(longs[0][0], (votes.get(longs[0][0]) ?? 0) + 1);
+        }
+        for (const [asset, n] of votes) {
+          if (n >= ctx.p("minWhales", 2)) hits.push({ cid, asset, whales: n, title: a.title });
+        }
+      }
       r.scanned = hits.length;
-      for (const [cid, a] of hits) {
-        const m = await ctx.api.fetchMarket(cid);
-        if (!m || m.closed) continue;
-        const idx = m.clobTokenIds.indexOf(a.asset);
-        const price = m.outcomePrices[idx];
-        if (idx < 0 || !(price <= ctx.p("maxPrice", 0.7))) continue;
-        const gate = canOpen(ctx);
+      for (const hit of hits.sort((x, y) => y.whales - x.whales)) {
+        const m = await ctx.api.fetchMarket(hit.cid);
+        if (!m || m.closed || !m.acceptingOrders) continue;
+        const hte = hoursToEnd(m);
+        if (hte !== null && hte < ctx.p("minHours", 2)) {
+          r.skipped++;
+          r.notes.push(`${short(hit.title, 30)}: до конца ${hte.toFixed(1)}ч < ${ctx.p("minHours", 2)}ч`);
+          continue;
+        }
+        const idx = m.clobTokenIds.indexOf(hit.asset);
+        const price = (await ctx.api.fetchMidPrice(hit.asset)) ?? m.outcomePrices[idx];
+        if (idx < 0 || !(price <= ctx.p("maxPrice", 0.7)) || price < ctx.p("minPrice", 0.08)) continue;
+        const gate = await canOpen(ctx, m.conditionId);
         if (gate) {
           r.notes.push(gate);
           break;
@@ -478,13 +473,13 @@ export const STRATEGIES: StrategyDef[] = [
           outcomeIndex: idx,
           price,
           usd: ctx.cfg.maxBetUsd,
-          confidence: Math.min(0.9, 0.5 + a.whales.size * 0.15),
-          reason: `${a.whales.size} кита купили в последние ${ctx.p("windowHours", 12)}ч`,
+          confidence: Math.min(0.9, 0.5 + hit.whales * 0.15),
+          reason: `${hit.whales} кита нетто-лонг за ${ctx.p("windowHours", 12)}ч`,
         });
         if (row) {
           r.opened++;
-          h.add(cid);
-          r.notes.push(`${short(a.title, 40)} — ${a.whales.size} китов`);
+          h.add(hit.cid);
+          r.notes.push(`${short(hit.title, 40)} — ${hit.whales} китов`);
         }
       }
       return r;
@@ -550,7 +545,7 @@ export const STRATEGIES: StrategyDef[] = [
       );
       r.scanned = ms.length;
       const bs = Math.max(2, ctx.p("batch", 5));
-      for (let i = 0; i < ms.length && !canOpen(ctx); i += bs) {
+      for (let i = 0; i < ms.length && !(await canOpen(ctx)); i += bs) {
         const batch = ms.slice(i, i + bs);
         const picks = await aiPick(ctx, batch, "Оцени рынки и реши, где у тебя есть понятное преимущество. Сомневаешься — не ставь.");
         await applyPicks(ctx, batch, picks, ctx.p("minConfidence", 0.75), r);
@@ -575,10 +570,10 @@ export const STRATEGIES: StrategyDef[] = [
       }
       const known = new Set((await listWhales()).map((w) => w.address.toLowerCase()));
       const cands = aggregateWhales(await ctx.api.fetchRecentTrades(300), 20)
-        .filter((c) => !known.has(c.wallet.toLowerCase()))
+        .filter((c: any) => !known.has(c.wallet.toLowerCase()))
         .slice(0, ctx.p("maxCheck", 5));
       r.scanned = cands.length;
-      const scores = await batchVerify(ctx.api, cands.map((c) => c.wallet), ctx.settings, ctx.log);
+      const scores = await batchVerify(ctx.api, cands.map((c: any) => c.wallet), ctx.settings, ctx.log);
       for (const s of scores) {
         await upsertVerifiedWallet({
           address: s.address,

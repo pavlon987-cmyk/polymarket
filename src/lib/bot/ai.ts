@@ -1,132 +1,77 @@
 import type { Settings } from "@/db/schema";
-import type { AiDecision } from "./types";
+import type { AiDecision, Strategy } from "./types";
+import type { ToolDef } from "./tools";
 
-export type AiSettings = Pick<
-  Settings,
-  "aiApiUrl" | "aiApiKey" | "aiModel" | "aiSystemPrompt" | "aiTemperature" | "aiTimeoutMs"
->;
+export type AiSettings = Pick<Settings, "aiApiUrl" | "aiApiKey" | "aiModel" | "aiSystemPrompt" | "aiTemperature" | "aiTimeoutMs">;
 
-/** Нормализуем URL: можно указать базу (…/v1) или полный путь до chat/completions */
-export function resolveChatUrl(url: string): string {
-  const u = url.trim().replace(/\/$/, "");
-  if (/\/chat\/completions$/.test(u)) return u;
-  if (/\/v1\/?$/.test(u)) return `${u}/chat/completions`;
-  if (/\/api\/?$/.test(u)) return `${u}/chat/completions`;
-  if (/\/v1\//.test(u)) return u.replace(/\/v1\/.*$/, "/v1/chat/completions");
-  if (u.includes("/v1")) return `${u}/chat/completions`;
-  return `${u}/v1/chat/completions`;
-}
+export type ChatMsg =
+  | { role: "system" | "user"; content: string }
+  | { role: "assistant"; content: string | null; tool_calls?: ToolCall[] }
+  | { role: "tool"; tool_call_id: string; content: string };
+export type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
 
-export function extractJson(text: string): Record<string, unknown> | null {
-  const cleaned = text.replace(/```(?:json)?/gi, "").trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      return null;
-    }
-  }
-}
+export type TradeContext = {
+  whale: { name: string; category: string; notes: string; strategy: Strategy };
+  trade: { title: string; outcome: string; price: number; whaleUsd: number; ageMin: number };
+  market: { question: string; volumeUsd: number; liquidityUsd: number; endDate: string | null; outcomes: string[]; outcomePrices: number[]; hoursToEnd: number | null };
+  portfolio: { cashUsd: number; equityUsd: number; openCount: number; categoryExposureUsd: number; categoryBudgetUsd: number; proposedBetUsd: number; overdraft: boolean };
+  whaleStats: unknown;
+  memory: string;
+};
 
+/** Один вызов OpenAI-совместимого chat/completions. Поддерживает tools (function calling). */
 export async function chatCompletion(
-  ai: AiSettings,
-  messages: { role: "system" | "user" | "assistant"; content: string }[]
-): Promise<{ content: string; raw: unknown }> {
+  s: AiSettings,
+  messages: ChatMsg[],
+  opts: { tools?: ToolDef[]; toolChoice?: "auto" | "none"; jsonMode?: boolean } = {}
+): Promise<{ content: string; toolCalls: ToolCall[]; raw: unknown }> {
+  if (!s.aiApiUrl) throw new Error("Не задан URL ИИ API");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ai.aiTimeoutMs || 30_000);
+  const timer = setTimeout(() => controller.abort(), s.aiTimeoutMs || 60_000);
   try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (ai.aiApiKey) {
-      headers.Authorization = `Bearer ${ai.aiApiKey}`;
-      headers["x-api-key"] = ai.aiApiKey;
+    const body: Record<string, unknown> = { model: s.aiModel, temperature: s.aiTemperature, messages };
+    if (opts.tools?.length) {
+      body.tools = opts.tools;
+      body.tool_choice = opts.toolChoice ?? "auto";
     }
-    headers["HTTP-Referer"] = "https://polymarket-copytrader.local";
-    headers["X-Title"] = "Polymarket Copy-Trader";
-
-    const res = await fetch(resolveChatUrl(ai.aiApiUrl), {
+    if (opts.jsonMode) body.response_format = { type: "json_object" };
+    const res = await fetch(s.aiApiUrl, {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json", ...(s.aiApiKey ? { Authorization: `Bearer ${s.aiApiKey}` } : {}), "HTTP-Referer": "https://github.com/pavlon987-cmyk/polymarket", "X-Title": "Polymarket Copy-Trader" },
+      body: JSON.stringify(body),
       signal: controller.signal,
-      body: JSON.stringify({ model: ai.aiModel, temperature: ai.aiTemperature, messages }),
     });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`AI HTTP ${res.status}: ${text.slice(0, 300)}`);
-    const json = JSON.parse(text);
-    const content: string =
-      json?.choices?.[0]?.message?.content ??
-      json?.message?.content ?? // Ollama native
-      json?.content?.[0]?.text ?? // Anthropic-style
-      "";
-    if (!content) throw new Error("Пустой ответ модели");
-    return { content, raw: json };
+    if (!res.ok) throw new Error(`ИИ HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const json = (await res.json()) as { choices?: { message?: { content?: string | null; tool_calls?: ToolCall[] } }[] };
+    const msg = json.choices?.[0]?.message;
+    return { content: msg?.content ?? "", toolCalls: msg?.tool_calls ?? [], raw: json };
   } finally {
     clearTimeout(timer);
   }
 }
 
-export type TradeContext = {
-  whale: { name: string; category: string; address: string; notes: string; promptExtra: string };
-  whaleStats: { copied: number; wins: number; losses: number; pnlUsd: number };
-  trade: { side: string; outcome: string; price: number; sizeShares: number; sizeUsd: number; ageMin: number };
-  market: {
-    question: string;
-    outcomes: string[];
-    outcomePrices: number[];
-    volumeUsd: number;
-    liquidityUsd: number;
-    endDate: string | null;
-    hoursToEnd: number | null;
-  };
-  portfolio: {
-    mode: string;
-    cashUsd: number;
-    equityUsd: number;
-    openPositions: number;
-    categoryExposureUsd: number;
-    categoryBudgetUsd: number;
-    proposedBetUsd: number;
-  };
-  /** блок памяти Васи (подмешивается в system) */
-  memory?: string;
-};
-
-export async function askAi(ai: AiSettings, ctx: TradeContext): Promise<AiDecision> {
-  const system = [
-    ai.aiSystemPrompt,
-    ctx.whale.promptExtra && `\nДополнительно про этого трейдера:\n${ctx.whale.promptExtra}`,
-    ctx.memory,
-  ]
-    .filter(Boolean)
-    .join("\n");
-  const ctxForUser: Partial<TradeContext> = { ...ctx };
-  delete ctxForUser.memory;
-  const user = `Контекст сделки (JSON):\n${JSON.stringify(ctxForUser, null, 2)}\n\nОтветь одним JSON-объектом.`;
-
+/** Решение COPY/SKIP по сделке кита */
+export async function askAi(settings: Settings, ctx: TradeContext): Promise<AiDecision> {
+  const user = `Сделка кита для копирования:\n${JSON.stringify({ ...ctx, memory: undefined }, null, 1)}\n${ctx.memory ? `\nПАМЯТЬ:\n${ctx.memory}` : ""}\n\nОтветь одним JSON: {"decision":"COPY"|"SKIP","confidence":0..1,"sizeMultiplier":0.25..2,"reason":"до 200 символов"}`;
   try {
-    const { content } = await chatCompletion(ai, [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ]);
-    const parsed = extractJson(content);
-    if (!parsed) {
-      return { decision: "SKIP", confidence: 0, sizeMultiplier: 1, reason: "Ответ ИИ не распарсился", raw: content, error: "parse" };
-    }
-    const decision = String(parsed.decision ?? "SKIP").toUpperCase() === "COPY" ? "COPY" : "SKIP";
-    const confidence = clamp(Number(parsed.confidence ?? 0), 0, 1);
-    const sizeMultiplier = clamp(Number(parsed.sizeMultiplier ?? 1) || 1, 0.25, 2);
-    const reason = String(parsed.reason ?? "").slice(0, 400);
-    return { decision, confidence, sizeMultiplier, reason, raw: content };
+    const { content, raw } = await chatCompletion(settings, [{ role: "system", content: settings.aiSystemPrompt }, { role: "user", content: user }], { jsonMode: true });
+    const cleaned = content.replace(/```(?:json)?/gi, "").trim();
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(m ? m[0] : cleaned) as Partial<AiDecision>;
+    return {
+      decision: parsed.decision === "COPY" ? "COPY" : "SKIP",
+      confidence: Math.max(0, Math.min(1, Number(parsed.confidence ?? 0))),
+      sizeMultiplier: Math.max(0.25, Math.min(2, Number(parsed.sizeMultiplier ?? 1))),
+      reason: String(parsed.reason ?? "").slice(0, 300),
+      raw: JSON.stringify(raw).slice(0, 2000),
+    };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { decision: "SKIP", confidence: 0, sizeMultiplier: 1, reason: `Ошибка ИИ: ${message}`, error: message };
+    return { decision: "SKIP", confidence: 0, sizeMultiplier: 1, reason: `ошибка ИИ: ${(err as Error).message}`, error: (err as Error).message };
   }
 }
 
-function clamp(n: number, lo: number, hi: number) {
-  if (!Number.isFinite(n)) return lo;
-  return Math.max(lo, Math.min(hi, n));
+export function extractJson(raw: string): unknown {
+  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
+  const m = cleaned.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+  return JSON.parse(m ? m[0] : cleaned);
 }

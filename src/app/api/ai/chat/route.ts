@@ -1,125 +1,103 @@
-import { chatCompletion } from "@/lib/bot/ai";
+import { chatCompletion, type ChatMsg } from "@/lib/bot/ai";
+import { computeLedger } from "@/lib/bot/ledger";
 import { buildMemoryBlock, extractRememberTags, memoryStats } from "@/lib/bot/memory";
-import {
-  addChatMessage,
-  getChatHistory,
-  getFullPortfolioSnapshot,
-  getSettings,
-  listWhales,
-} from "@/lib/bot/store";
+import { realtime } from "@/lib/bot/realtime";
+import { getRunnerState } from "@/lib/bot/runner";
+import { addChatMessage, clearChatHistory, getChatHistory, getSettings, listWhales, openPositions } from "@/lib/bot/store";
+import { runTool, TOOLS } from "@/lib/bot/tools";
 import type { TradingMode } from "@/lib/bot/types";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 180;
 
-const CHAT_SYSTEM_PROMPT = `Ты — **Вася**, ИИ-трейдер и финансовый советник, работающий в штате копитрейдера Polymarket.
+const SYSTEM = `Ты — **Вася**, ИИ-трейдер и операционный ассистент копитрейдера Polymarket. У тебя есть ИНСТРУМЕНТЫ — ты не «советуешь», а ДЕЛАЕШЬ.
 
-## Твоя миссия
-Помогать пользователю зарабатывать на предиктивных рынках Polymarket. Твоя главная задача — **делать портфель прибыльным даже когда копируемые киты убыточны**.
+## Как работать
+1. Любой вопрос о деньгах/позициях → сначала вызови get_portfolio / list_positions (не отвечай по памяти).
+2. Просьба «купи/продай/закрой/запусти/включи/выключи/поменяй» → вызови соответствующий инструмент, затем кратко отчитайся результатом инструмента (id позиции, цена, новый кэш).
+3. Если инструмент вернул needsConfirm — опиши действие одной строкой и спроси «Подтверждаешь?». После «да» — повтори вызов с confirm=true.
+4. Если инструмент вернул error — объясни причину человеческим языком и предложи, что сделать.
+5. Никогда не выдумывай числа: цитируй значения из ответов инструментов.
 
-## Твои возможности
-- Анализировать открытые позиции и рекомендовать хеджинг (покупка противоположного исхода)
-- Оценивать каждого кита: насколько он надёжен, какие рынки его конёк
-- Рекомендовать размеры ставок на основе текущего состояния портфеля
-- Объяснять рыночные тенденции и помогать принимать решения
-- Выявлять когда кит теряет деньги и рекомендовать снижения экспозиции
-- При обнаружении убыточного кита — советовать перераспределение на других
+## Правила про деньги (леджер)
+- Эквити = кэш + стоимость открытых = стартовый банк + реализованный P&L + нереализованный P&L. Если get_portfolio показывает cashDriftUsd ≠ 0 или overdraft=true — сообщи об этом первым делом и предложи reconcile.
+- Деньги «извне» появляются только через cash_adjustment с причиной.
+- Одна открытая позиция на рынок. Если пользователь просит купить рынок, который уже есть — скажи об этом.
 
-## Правила
-- Всегда отвечай на русском языке
-- Будь конкретным: указывай цифры, проценты, цены
-- Рискуй умеренно: консервативная стратегия — 2-8% банка на ставку
-- Всегда объясняй логику: зачем хедж, почему размер такой
-- Если пользователь просит совет — дай чёткий ответ с обоснованием
-- Если рыночная ситуация непонятна — скажи честно
-- Используй эмодзи для наглядности: 📊 💰 ⚠️ 🎯 ✅ ❌ 🛡️
-- Форматируй ответы: жирный текст, списки, таблицы где уместно
-- У тебя есть долговременная память (блок «ПАМЯТЬ ВАСИ»). Опирайся на неё. Если пользователь просит что-то запомнить или ты сам понял важное правило — добавь в конец ответа строку [[ЗАПОМНИ: краткое правило]] (можно несколько).
-
-## Формат ответов
-- Короткие вопросы: ответ 2-4 предложения
-- Анализ портфеля: подробный с таблицами
-- Рекомендации: всегда с рисками и альтернативами
-- При ответе на "что делать" — давай конкретный план действий с точными цифрами`;
-
-type Msg = { role: "system" | "user" | "assistant"; content: string };
+## Стиль
+- Русский язык, конкретные цифры, эмодзи 📊 💰 ⚠️ 🎯 ✅ ❌ 🛡️, короткие таблицы.
+- Не здоровайся повторно в идущем диалоге.
+- Чтобы что-то запомнить надолго, вызови remember (или добавь [[ЗАПОМНИ: …]]).`;
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const clear = url.searchParams.get("clear");
-  if (clear === "true") {
-    const { clearChatHistory: clearFn } = await import("@/lib/bot/store");
-    await clearFn();
+  if (url.searchParams.get("clear") === "true") {
+    await clearChatHistory();
     return Response.json({ ok: true, messages: [] });
   }
-  const messages = await getChatHistory(60);
-  return Response.json({ messages });
+  if (url.searchParams.get("tools") === "true") return Response.json({ tools: TOOLS.map((t) => ({ name: t.function.name, description: t.function.description })) });
+  return Response.json({ messages: await getChatHistory(80) });
 }
 
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as { message?: string; mode?: string };
   const message = (body.message ?? "").trim();
   if (!message) return Response.json({ error: "message required" }, { status: 400 });
-
-  const mode: TradingMode = body.mode === "live" ? "live" : "paper";
   const settings = await getSettings();
+  const mode: TradingMode = body.mode === "live" ? "live" : (settings.tradingMode as TradingMode) === "live" ? "live" : "paper";
 
-  // Сохраняем сообщение пользователя
   await addChatMessage("user", message);
-
-  // Собираем контекст
   const history = await getChatHistory(40);
-  const isFirstMessage = history.length <= 1;
-  const [snapshot, whales, memory, mstats] = await Promise.all([
-    getFullPortfolioSnapshot(mode),
+  const [ledger, open, whales, memory, mstats] = await Promise.all([
+    computeLedger(mode).catch(() => null),
+    openPositions(mode),
     listWhales(),
-    settings.aiMemoryEnabled ? buildMemoryBlock({}, 4000) : "",
+    settings.aiMemoryEnabled ? buildMemoryBlock({}, 3500) : "",
     memoryStats(),
   ]);
+  const runner = getRunnerState();
 
-  const systemWithContext = `${CHAT_SYSTEM_PROMPT}
+  const system = `${SYSTEM}
 
-## Текущее состояние системы в реальном времени
-Портфель и киты:
-\`\`\`json
-${snapshot}
-\`\`\`
+## Снимок (режим ${mode.toUpperCase()}, ${new Date().toLocaleString("ru-RU")})
+Леджер: ${JSON.stringify(ledger)}
+Открытых позиций: ${open.length} → ${open.slice(0, 20).map((p) => `#${p.id} ${p.market.slice(0, 40)} [${p.outcome}] ${Math.round(p.price * 100)}¢→${Math.round((p.lastPrice ?? p.price) * 100)}¢ $${p.costUsd.toFixed(2)}`).join("; ")}
+Авто-цикл: ${runner.running ? "включён" : "выключен"}, цикл идёт: ${runner.cycleInProgress}
+Киты: ${whales.map((w) => `${w.name}${w.enabled ? "" : " (выкл)"}`).join(", ")}
+Память: ${mstats.total} записей.${memory}`;
 
-Активные киты:
-${whales.map((w) => `- ${w.name} (${w.category}) ${w.enabled ? "✅" : "⏸"}: ${w.notes || "без заметок"}`).join("\n")}
-
-В памяти ${mstats.total} записей.${memory}
-
-## Правила ведения диалога:
-- Ты ведешь постоянный живой диалог с пользователем.
-${isFirstMessage ? "- Это первое сообщение в диалоге: коротко поздоровайся и представься." : "- Диалог уже идет! КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО здороваться («Привет!», «Здравствуйте») и заново представляться («Я Вася...»). Сразу отвечай на вопрос пользователя по существу."}
-- Держи контекст предыдущих реплик пользователя и своих прошлых ответов.`;
-
-  // Собираем все сообщения для API (history уже содержит только что добавленное сообщение пользователя)
-  const apiMessages: Msg[] = [
-    { role: "system", content: systemWithContext },
-    ...history.slice(-30).map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
-  ];
+  const msgs: ChatMsg[] = [{ role: "system", content: system }, ...history.slice(-30).map((m) => ({ role: m.role as "user" | "assistant", content: m.content }))];
+  const aiSettings = { aiApiUrl: settings.aiApiUrl, aiApiKey: settings.aiApiKey, aiModel: settings.aiModel, aiSystemPrompt: SYSTEM, aiTemperature: Math.max(settings.aiTemperature, 0.2), aiTimeoutMs: 90_000 };
+  const toolLog: { name: string; args: unknown; result: unknown }[] = [];
 
   try {
-    const aiSettings = {
-      aiApiUrl: settings.aiApiUrl,
-      aiApiKey: settings.aiApiKey,
-      aiModel: settings.aiModel,
-      aiSystemPrompt: CHAT_SYSTEM_PROMPT,
-      aiTemperature: Math.max(settings.aiTemperature, 0.3),
-      aiTimeoutMs: 60_000,
-    };
-
-    const { content } = await chatCompletion(aiSettings, apiMessages);
-    const cleaned = await extractRememberTags(content);
-    await addChatMessage("assistant", cleaned);
-
-    return Response.json({ ok: true, reply: cleaned });
+    // Цикл инструментов: модель может вызвать несколько подряд (до 8 раундов)
+    let reply = "";
+    for (let round = 0; round < 8; round++) {
+      const { content, toolCalls } = await chatCompletion(aiSettings, msgs, { tools: TOOLS });
+      if (!toolCalls.length) {
+        reply = content;
+        break;
+      }
+      msgs.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
+      for (const tc of toolCalls) {
+        let args: Record<string, unknown> = {};
+        try { args = JSON.parse(tc.function.arguments || "{}"); } catch { /* пустые аргументы */ }
+        realtime.publish("chat", { role: "tool_call", content: `${tc.function.name}(${JSON.stringify(args)})`, tool: tc.function.name });
+        const result = await runTool(tc.function.name, args, mode);
+        toolLog.push({ name: tc.function.name, args, result });
+        msgs.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(result).slice(0, 12_000) });
+      }
+      if (round === 7) reply = "Слишком длинная цепочка действий — остановился. Что сделано: " + toolLog.map((t) => t.name).join(" → ");
+    }
+    const cleaned = await extractRememberTags(reply || "(пустой ответ модели)");
+    await addChatMessage("assistant", cleaned, { tools: toolLog.map((t) => ({ name: t.name, args: t.args })) });
+    realtime.publish("chat", { role: "assistant", content: cleaned });
+    return Response.json({ ok: true, reply: cleaned, tools: toolLog });
   } catch (err) {
-    const errorMsg = `⚠️ Ошибка ИИ: ${(err as Error).message}. Проверьте настройки API ключа и URL на странице «Настройки» → ИИ.`;
+    const errorMsg = `⚠️ Ошибка ИИ: ${(err as Error).message}. Проверь URL/ключ/модель в Настройках → ИИ (модель должна поддерживать function calling: gpt-4o-mini, deepseek-chat, llama-3.3-70b, qwen2.5 и т.п.).`;
     await addChatMessage("assistant", errorMsg);
-    return Response.json({ ok: false, reply: errorMsg });
+    return Response.json({ ok: false, reply: errorMsg, tools: toolLog });
   }
 }

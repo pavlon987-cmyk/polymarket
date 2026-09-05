@@ -1,4 +1,5 @@
-import { boolean, doublePrecision, integer, jsonb, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
+import { boolean, doublePrecision, index, integer, jsonb, pgTable, serial, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import type { AiDecision, Strategy } from "@/lib/bot/types";
 import { DEFAULT_AI_PROMPT, DEFAULT_STRATEGY } from "@/lib/bot/types";
 
@@ -21,6 +22,11 @@ export const settings = pgTable("settings", {
   defaultStrategy: jsonb("default_strategy").$type<Strategy>().notNull().default(DEFAULT_STRATEGY),
   maxDaysToEnd: integer("max_days_to_end").notNull().default(30),
   minHoursToEnd: integer("min_hours_to_end").notNull().default(6),
+  aiAutoCut: boolean("ai_auto_cut").notNull().default(false),
+  aiAutoHedge: boolean("ai_auto_hedge").notNull().default(false),
+  paperFeeBps: integer("paper_fee_bps").notNull().default(0),
+  wsEnabled: boolean("ws_enabled").notNull().default(true),
+  maxSlippageCents: integer("max_slippage_cents").notNull().default(3),
 
   // сеть / API
   dataApiUrl: text("data_api_url").notNull().default("https://data-api.polymarket.com"),
@@ -113,9 +119,42 @@ export const positions = pgTable("positions", {
   whaleSizeShares: doublePrecision("whale_size_shares"),
   aiDecision: jsonb("ai_decision").$type<AiDecision | null>(),
   liveOrderId: text("live_order_id"),
+  marketEndAt: timestamp("market_end_at", { withTimezone: true }),
   openedAt: timestamp("opened_at", { withTimezone: true }).notNull().defaultNow(),
   closedAt: timestamp("closed_at", { withTimezone: true }),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+},
+  (t) => [
+    uniqueIndex("positions_one_open_per_token").on(t.mode, t.tokenId).where(sql`${t.status} = 'OPEN'`),
+    index("positions_open_by_condition").on(t.mode, t.conditionId).where(sql`${t.status} = 'OPEN'`),
+  ]
+);
+
+export const cashAdjustments = pgTable("cash_adjustments", {
+  id: serial("id").primaryKey(),
+  mode: text("mode").notNull(),
+  amountUsd: doublePrecision("amount_usd").notNull(),
+  reason: text("reason").notNull().default(""),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const cycleLocks = pgTable("cycle_locks", {
+  name: text("name").primaryKey(),
+  lockedBy: text("locked_by").notNull(),
+  lockedAt: timestamp("locked_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const liveFills = pgTable("live_fills", {
+  id: serial("id").primaryKey(),
+  orderId: text("order_id"),
+  tradeId: text("trade_id").unique(),
+  tokenId: text("token_id").notNull(),
+  side: text("side").notNull(),
+  price: doublePrecision("price").notNull(),
+  size: doublePrecision("size").notNull(),
+  status: text("status").notNull(),
+  raw: jsonb("raw"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const seenTrades = pgTable("seen_trades", {
@@ -222,3 +261,6 @@ export type MarketSnapshot = typeof marketSnapshots.$inferSelect;
 export type VerifiedWallet = typeof verifiedWallets.$inferSelect;
 export type AiMemoryRow = typeof aiMemory.$inferSelect;
 export type StrategyConfigRow = typeof strategyConfigs.$inferSelect;
+export type CashAdjustment = typeof cashAdjustments.$inferSelect;
+export type CycleLock = typeof cycleLocks.$inferSelect;
+export type LiveFill = typeof liveFills.$inferSelect;

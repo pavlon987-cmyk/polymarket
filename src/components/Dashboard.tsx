@@ -48,6 +48,122 @@ const roi = (p: Position, pnl: number) => (p.costUsd ? (pnl / p.costUsd) * 100 :
 const short = (s: string, n = 60) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const secondsTo = (iso: string | null) => (iso ? Math.max(0, Math.round((new Date(iso).getTime() - Date.now()) / 1000)) : null);
 
+export type Ledger = {
+  mode: string;
+  startingBankUsd: number;
+  cashUsd: number;
+  marketValueUsd: number;
+  equityUsd: number;
+  realizedPnlUsd: number;
+  unrealizedPnlUsd: number;
+  costAllUsd: number;
+  openCount: number;
+  closedCount: number;
+  wins: number;
+  losses: number;
+  soldCount: number;
+  pendingResolveCount: number;
+  overdraft: boolean;
+  storedCashUsd: number;
+  cashDriftUsd: number;
+  identityErrorUsd: number;
+};
+
+export function useLedger(mode: string) {
+  const [ledger, setLedger] = useState<Ledger | null>(null);
+  const [prices, setPrices] = useState<Record<string, number>>({});
+  const [lastEvent, setLastEvent] = useState<string>("");
+
+  const refresh = () =>
+    fetch(`/api/bot/reconcile?mode=${mode}`)
+      .then((r) => r.json())
+      .then(setLedger)
+      .catch(() => {});
+
+  useEffect(() => {
+    void refresh();
+    const es = new EventSource(`/api/stream?mode=${mode}`);
+    es.onmessage = (e) => {
+      try {
+        const ev = JSON.parse(e.data) as { type: string; data: any };
+        if (ev.type === "hello" || ev.type === "ledger") {
+          if (ev.data?.ledger) setLedger(ev.data.ledger);
+          else if (ev.data) setLedger(ev.data);
+        }
+        if (ev.type === "price" && ev.data?.tokenId) {
+          setPrices((p) => ({ ...p, [ev.data.tokenId]: ev.data.price }));
+        }
+        if (ev.type === "position" || ev.type === "cycle") {
+          void refresh();
+        }
+        setLastEvent(`${ev.type} · ${new Date().toLocaleTimeString("ru-RU")}`);
+      } catch {}
+    };
+    return () => es.close();
+  }, [mode]);
+
+  return { ledger, prices, lastEvent, refresh };
+}
+
+function LedgerCard({ label, icon, value, sub, tone = "slate" }: { label: string; icon: string; value: string; sub?: React.ReactNode; tone?: "green" | "red" | "slate" }) {
+  const color = tone === "green" ? "text-emerald-400" : tone === "red" ? "text-rose-400" : "text-slate-100";
+  return (
+    <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+      <div className="text-xs text-slate-400">{label} {icon}</div>
+      <div className={`text-xl font-semibold ${color}`}>{value}</div>
+      {sub && <div className="text-[11px] text-slate-500">{sub}</div>}
+    </div>
+  );
+}
+
+export function LedgerCards({ mode, onAction }: { mode: string; onAction?: () => void }) {
+  const { ledger: l, lastEvent, refresh } = useLedger(mode);
+  const [busy, setBusy] = useState(false);
+  if (!l) return <div className="text-slate-400">Загрузка леджера…</div>;
+  const ret = l.startingBankUsd ? ((l.equityUsd - l.startingBankUsd) / l.startingBankUsd) * 100 : 0;
+  const drift = Math.abs(l.cashDriftUsd) > 0.01;
+  const fix = async (dedupe = false) => {
+    setBusy(true);
+    await fetch("/api/bot/reconcile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, dedupe }),
+    });
+    await refresh();
+    if (onAction) onAction();
+    setBusy(false);
+  };
+  return (
+    <div className="space-y-3">
+      {(drift || l.overdraft || l.identityErrorUsd > 0.01) && (
+        <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-200">
+          ⚠️ <b>Расхождение учёта.</b> Кэш в БД {usd(l.storedCashUsd)}, по леджеру {usd(l.cashUsd)} (дрейф {usd(l.cashDriftUsd)}).
+          {l.overdraft && <> <b>Овердрафт</b> — позиции открыты на несуществующие деньги; новые входы заблокированы.</>}
+          <div className="mt-2 flex gap-2">
+            <button disabled={busy} onClick={() => fix(false)} className="rounded bg-rose-500 px-3 py-1 text-white hover:bg-rose-600 transition">
+              {busy ? "Сверка…" : "Сверить и исправить"}
+            </button>
+            <button disabled={busy} onClick={() => fix(true)} className="rounded border border-rose-400 px-3 py-1 text-rose-200 hover:bg-rose-500/20 transition">
+              + закрыть дубли
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-6">
+        <LedgerCard label="Эквити" icon="💎" value={usd(l.equityUsd)} sub={<span className={ret >= 0 ? "text-emerald-400" : "text-rose-400"}>{pct(ret)} от {usd(l.startingBankUsd)}</span>} tone={ret >= 0 ? "green" : "red"} />
+        <LedgerCard label="Кэш" icon="💵" value={usd(l.cashUsd)} sub={`${l.equityUsd ? Math.round((l.cashUsd / l.equityUsd) * 100) : 0}% эквити свободно`} tone={l.cashUsd < 0 ? "red" : "slate"} />
+        <LedgerCard label="В позициях" icon="📂" value={usd(l.marketValueUsd)} sub={`${l.openCount} открытых${l.pendingResolveCount ? ` · ⏳ ${l.pendingResolveCount} ждут резолва` : ""}`} />
+        <LedgerCard label="Реализ. P&L" icon="🏦" value={usd(l.realizedPnlUsd)} sub={`оборот ${usd(l.costAllUsd)}`} tone={l.realizedPnlUsd >= 0 ? "green" : "red"} />
+        <LedgerCard label="Нереализ. P&L" icon="📈" value={usd(l.unrealizedPnlUsd)} sub="по текущим ценам (WS)" tone={l.unrealizedPnlUsd >= 0 ? "green" : "red"} />
+        <LedgerCard label="Win rate" icon="🎯" value={`${l.wins + l.losses ? Math.round((l.wins / (l.wins + l.losses)) * 100) : 0}%`} sub={`W ${l.wins} · L ${l.losses} · закрыто ${l.closedCount} (из них продано ${l.soldCount})`} />
+      </div>
+      <div className="text-xs text-slate-500">
+        Тождество: {usd(l.startingBankUsd)} + {usd(l.realizedPnlUsd)} + {usd(l.unrealizedPnlUsd)} = {usd(l.equityUsd)} · ошибка {usd(l.identityErrorUsd)} · последнее событие: {lastEvent || "—"}
+      </div>
+    </div>
+  );
+}
+
 export function Dashboard() {
   const [viewMode, setViewMode] = useState<"paper" | "live" | null>(null);
   const [s, setS] = useState<Status | null>(null);
@@ -227,15 +343,8 @@ export function Dashboard() {
         </Alert>
       )}
 
-      {/* Статы */}
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-        <Stat label="Эквити" icon="💎" tone={ret > 0 ? "green" : ret < 0 ? "red" : "slate"} value={usd(p.equity)} sub={<span className={ret >= 0 ? "text-emerald-400" : "text-rose-400"}>{pct(ret)} от {usd(p.startingBankUsd)}</span>} />
-        <Stat label="Кэш" icon="💵" value={usd(p.cashUsd)} sub={`${p.equity ? Math.round((p.cashUsd / p.equity) * 100) : 0}% эквити свободно`} />
-        <Stat label="В позициях" icon="📂" value={usd(p.inPositions)} sub={`${s.open.length} открытых`} />
-        <Stat label="Реализ. P&L" icon="🏦" tone={p.realizedPnlUsd > 0 ? "green" : p.realizedPnlUsd < 0 ? "red" : "slate"} value={<Pnl value={p.realizedPnlUsd} className="text-2xl" />} sub={`оборот ${usd(p.totalInvestedUsd)}`} />
-        <Stat label="Нереализ. P&L" icon="📈" tone={unrealTotal > 0 ? "green" : unrealTotal < 0 ? "red" : "slate"} value={<Pnl value={unrealTotal} className="text-2xl" />} sub="по текущим ценам" />
-        <Stat label="Win rate" icon="🎯" value={winRate === null ? "—" : `${winRate.toFixed(0)}%`} sub={`W ${wins} · L ${losses} · S ${sold}`} />
-      </div>
+      {/* Статы (Леджер) */}
+      <LedgerCards mode={s.mode} onAction={load} />
 
       {/* Открытые позиции */}
       <Card

@@ -250,3 +250,8 @@ export async function extractRememberTags(reply: string): Promise<string> {
   }
   return reply.replace(re, "").trim();
 }
+
+export async function rememberFact(text: string, topic = "general") {
+  await db.execute(sql`insert into ai_memory (kind, subject, content, importance, created_at) values ('lesson', ${topic}, ${text}, 0.9, now())`);
+  return { ok: true };
+}

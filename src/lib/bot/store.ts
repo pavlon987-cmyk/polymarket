@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { existsSync, readFileSync } from "node:fs";
 import { db } from "@/db";
+import { computeLedger } from "./ledger";
 import {
   aiChatMessages,
   aiDecisions,
@@ -132,13 +133,11 @@ export async function getPortfolio(mode: TradingMode, s?: Settings): Promise<Por
   return again[0];
 }
 
-export async function savePortfolio(p: PortfolioRow): Promise<void> {
+/** Только метаданные. Деньги — через ledger.ts. */
+export async function savePortfolioMeta(p: PortfolioRow): Promise<void> {
   await db
     .update(portfolios)
     .set({
-      cashUsd: p.cashUsd,
-      realizedPnlUsd: p.realizedPnlUsd,
-      totalInvestedUsd: p.totalInvestedUsd,
       halted: p.halted,
       cyclesRun: p.cyclesRun,
       lastCycleAt: p.lastCycleAt,
@@ -146,6 +145,10 @@ export async function savePortfolio(p: PortfolioRow): Promise<void> {
       lastUpdated: new Date(),
     })
     .where(eq(portfolios.mode, p.mode));
+}
+
+export async function savePortfolio(p: PortfolioRow): Promise<void> {
+  await savePortfolioMeta(p);
 }
 
 export async function resetPortfolio(mode: TradingMode): Promise<void> {
@@ -245,59 +248,54 @@ export function positionsValue(rows: PositionRow[]): number {
   return rows.reduce((s, x) => s + x.shares * (x.lastPrice ?? x.price), 0);
 }
 
-export type WhaleStats = {
-  whaleName: string;
-  copied: number;
-  open: number;
-  wins: number;
-  losses: number;
-  sold: number;
-  investedUsd: number;
-  pnlUsd: number;
-  unrealizedUsd: number;
-};
+export type WhaleStats = { whaleName: string; copied: number; open: number; wins: number; losses: number; flat: number; sold: number; investedUsd: number; pnlUsd: number; unrealizedUsd: number; winRate: number };
 
 export async function whaleStats(mode: TradingMode): Promise<WhaleStats[]> {
   const rows = await db.select().from(positions).where(and(eq(positions.mode, mode), eq(positions.source, "copy")));
   const map = new Map<string, WhaleStats>();
   for (const r of rows) {
-    const s =
-      map.get(r.whaleName) ??
-      { whaleName: r.whaleName, copied: 0, open: 0, wins: 0, losses: 0, sold: 0, investedUsd: 0, pnlUsd: 0, unrealizedUsd: 0 };
+    const s = map.get(r.whaleName) ?? { whaleName: r.whaleName, copied: 0, open: 0, wins: 0, losses: 0, flat: 0, sold: 0, investedUsd: 0, pnlUsd: 0, unrealizedUsd: 0, winRate: 0 };
     s.copied++;
     s.investedUsd += r.costUsd;
     if (r.status === "OPEN") {
       s.open++;
       s.unrealizedUsd += r.shares * (r.lastPrice ?? r.price) - r.costUsd;
     } else {
-      if (r.status === "WON" || (r.profitUsd ?? 0) > 0) s.wins++;
-      else if (r.status === "LOST" || (r.profitUsd ?? 0) < 0) s.losses++;
+      const pnl = r.profitUsd ?? 0;
+      if (pnl > 0.005) s.wins++;
+      else if (pnl < -0.005) s.losses++;
+      else s.flat++;
       if (r.status === "SOLD") s.sold++;
-      s.pnlUsd += r.profitUsd ?? 0;
+      s.pnlUsd += pnl;
     }
+    s.winRate = s.wins + s.losses ? s.wins / (s.wins + s.losses) : 0;
     map.set(r.whaleName, s);
   }
   return [...map.values()].sort((a, b) => b.pnlUsd - a.pnlUsd);
 }
 
-export type SourceStat = { open: number; closed: number; wins: number; losses: number; investedUsd: number; pnlUsd: number; unrealizedUsd: number };
+export type SourceStat = { open: number; closed: number; wins: number; losses: number; flat: number; investedUsd: number; pnlUsd: number; unrealizedUsd: number; winRate: number; avgPnlUsd: number };
 
 /** Статистика по источникам (стратегиям) */
 export async function sourceStats(mode: TradingMode): Promise<Record<string, SourceStat>> {
   const rows = await db.select().from(positions).where(eq(positions.mode, mode));
   const map = new Map<string, SourceStat>();
   for (const r of rows) {
-    const s = map.get(r.source) ?? { open: 0, closed: 0, wins: 0, losses: 0, investedUsd: 0, pnlUsd: 0, unrealizedUsd: 0 };
+    const s = map.get(r.source) ?? { open: 0, closed: 0, wins: 0, losses: 0, flat: 0, investedUsd: 0, pnlUsd: 0, unrealizedUsd: 0, winRate: 0, avgPnlUsd: 0 };
     s.investedUsd += r.costUsd;
     if (r.status === "OPEN") {
       s.open++;
       s.unrealizedUsd += r.shares * (r.lastPrice ?? r.price) - r.costUsd;
     } else {
       s.closed++;
-      s.pnlUsd += r.profitUsd ?? 0;
-      if (r.status === "WON" || (r.profitUsd ?? 0) > 0) s.wins++;
-      else if (r.status === "LOST" || (r.profitUsd ?? 0) < 0) s.losses++;
+      const pnl = r.profitUsd ?? 0;
+      s.pnlUsd += pnl;
+      if (pnl > 0.005) s.wins++;
+      else if (pnl < -0.005) s.losses++;
+      else s.flat++;
     }
+    s.winRate = s.wins + s.losses ? s.wins / (s.wins + s.losses) : 0;
+    s.avgPnlUsd = s.closed ? s.pnlUsd / s.closed : 0;
     map.set(r.source, s);
   }
   return Object.fromEntries(map);
@@ -364,48 +362,25 @@ export async function clearChatHistory(): Promise<void> {
 }
 
 export async function getFullPortfolioSnapshot(mode: TradingMode): Promise<string> {
-  const [p, open, closed, stats, src] = await Promise.all([
-    getPortfolio(mode),
-    openPositions(mode),
-    closedPositions(mode, 30),
-    whaleStats(mode),
-    sourceStats(mode),
-  ]);
-  const inPos = positionsValue(open);
-  return JSON.stringify({
-    mode,
-    cash: p.cashUsd,
-    equity: p.cashUsd + inPos,
-    pnl: p.realizedPnlUsd,
-    totalInvested: p.totalInvestedUsd,
-    openPositions: open.map((x) => ({
-      id: x.id,
-      source: x.source,
-      market: x.market,
-      outcome: x.outcome,
-      entry: x.price,
-      now: x.lastPrice ?? x.price,
-      cost: x.costUsd,
-      shares: x.shares,
-      pnl: x.shares * (x.lastPrice ?? x.price) - x.costUsd,
-      whale: x.whaleName,
-      open: x.openedAt,
-    })),
-    recentClosed: closed.slice(0, 15).map((x) => ({
-      source: x.source,
-      market: x.market,
-      outcome: x.outcome,
-      entry: x.price,
-      status: x.status,
-      pnl: x.profitUsd,
-      whale: x.whaleName,
-      close: x.closedAt,
-    })),
-    whaleStats: stats,
-    strategyStats: src,
-    startedBank: p.startingBankUsd,
-    halted: p.halted,
-  });
+  const [led, open, stats, src] = await Promise.all([computeLedger(mode), openPositions(mode), whaleStats(mode), sourceStats(mode)]);
+  return JSON.stringify({ mode, ledger: led, openPositions: open.map((x) => ({ id: x.id, source: x.source, market: x.market, outcome: x.outcome, entry: x.price, now: x.lastPrice ?? x.price, cost: x.costUsd, pnl: x.shares * (x.lastPrice ?? x.price) - x.costUsd, whale: x.whaleName, endsAt: x.marketEndAt })), whaleStats: stats, strategyStats: src });
+}
+
+export async function saveStrategyConfig(id: string, patch: { enabled?: boolean; maxBetUsd?: number; maxPositions?: number; params?: Record<string, unknown> }): Promise<StrategyConfigRow> {
+  const [cur] = await db.select().from(strategyConfigs).where(eq(strategyConfigs.id, id));
+  if (!cur) throw new Error(`стратегия ${id} не найдена`);
+  const [row] = await db
+    .update(strategyConfigs)
+    .set({
+      enabled: patch.enabled ?? cur.enabled,
+      maxBetUsd: patch.maxBetUsd ?? cur.maxBetUsd,
+      maxPositions: patch.maxPositions ?? cur.maxPositions,
+      params: { ...(cur.params as Record<string, number | string | boolean>), ...((patch.params ?? {}) as Record<string, number | string | boolean>) },
+      updatedAt: new Date(),
+    })
+    .where(eq(strategyConfigs.id, id))
+    .returning();
+  return row;
 }
 
 // ── Market snapshots ─────────────────────────────────────────────────────────

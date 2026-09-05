@@ -20,11 +20,12 @@ export async function POST(req: Request) {
   try {
     const ping = await chatCompletion(ai, [{ role: "user", content: "Ответь одним словом: OK" }]);
     const decision = await askAi(ai, {
-      whale: { name: "🎾 Tennis Pro", category: "Tennis", address: "0xtest", notes: "", promptExtra: "" },
+      whale: { name: "🎾 Tennis Pro", category: "Tennis", notes: "", strategy: s.defaultStrategy },
       whaleStats: { copied: 12, wins: 8, losses: 4, pnlUsd: 14.2 },
-      trade: { side: "BUY", outcome: "Yes", price: 0.42, sizeShares: 1500, sizeUsd: 630, ageMin: 12 },
+      trade: { title: "Will Sinner win?", outcome: "Yes", price: 0.42, whaleUsd: 630, ageMin: 12 },
       market: { question: "Will Sinner win the US Open 2026 final?", outcomes: ["Yes", "No"], outcomePrices: [0.42, 0.58], volumeUsd: 250000, liquidityUsd: 40000, endDate: new Date(Date.now() + 86400000 * 2).toISOString(), hoursToEnd: 48 },
-      portfolio: { mode: "paper", cashUsd: 80, equityUsd: 95, openPositions: 3, categoryExposureUsd: 10, categoryBudgetUsd: 30, proposedBetUsd: 4 },
+      portfolio: { cashUsd: 80, equityUsd: 95, openCount: 3, categoryExposureUsd: 10, categoryBudgetUsd: 30, proposedBetUsd: 4, overdraft: false },
+      memory: "",
     });
     return Response.json({ ok: true, ms: Date.now() - t0, ping: ping.content.slice(0, 200), decision });
   } catch (err) {

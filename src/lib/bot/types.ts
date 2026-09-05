@@ -114,6 +114,14 @@ export type MarketInfo = {
   liquidityUsd: number;
   closed: boolean;
   endDate: string | null;
+  slug?: string;
+  active?: boolean;
+  acceptingOrders?: boolean;
+  umaResolutionStatus?: string | null;
+  closedTime?: string | null;
+  bestBid?: number | null;
+  bestAsk?: number | null;
+  eventSlug?: string;
 };
 
 export type CycleResult = {

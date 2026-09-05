@@ -1,11 +1,18 @@
 import type { Settings } from "@/db/schema";
 import type { MarketInfo, WhaleTrade } from "./types";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * Клиент публичных API Polymarket. Проверено 05.09.2026:
+ *   gamma-api.polymarket.com/markets?condition_ids=…  → conditionId, question, outcomes, outcomePrices,
+ *        clobTokenIds, closed, active, acceptingOrders, umaResolutionStatus, endDate, closedTime, bestBid, bestAsk
+ *   clob.polymarket.com/midpoint | /price | /book | /prices-history | /spread | /time
+ *   data-api.polymarket.com/trades?user= | /activity?user= | /positions?user= | /holders?market=
+ * (эндпоинт /leaderboard в data-api отдаёт 404 — не используем)
+ */
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const BROWSER_HEADERS: Record<string, string> = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   Accept: "application/json, text/plain, */*",
   "Accept-Language": "en-US,en;q=0.9",
   Origin: "https://polymarket.com",
@@ -13,16 +20,17 @@ const BROWSER_HEADERS: Record<string, string> = {
 };
 
 export type HttpOptions = {
-  settings: Pick<
-    Settings,
-    "httpProxyUrl" | "extraHeadersJson" | "requestDelayMs" | "dataApiUrl" | "gammaApiUrl" | "clobApiUrl"
-  >;
+  settings: Pick<Settings, "httpProxyUrl" | "extraHeadersJson" | "requestDelayMs" | "dataApiUrl" | "gammaApiUrl" | "clobApiUrl">;
   log?: (msg: string) => void;
 };
 
+export type OrderBook = { tokenId: string; bids: { price: number; size: number }[]; asks: { price: number; size: number }[]; bestBid: number; bestAsk: number; spread: number; depthUsd: number };
+export type PricePoint = { t: number; p: number };
+export type UserPosition = { conditionId: string; asset: string; title: string; outcome: string; size: number; avgPrice: number; curPrice: number; cashPnl: number; percentPnl: number; redeemable: boolean };
+export type Holder = { proxyWallet: string; name: string; amount: number; outcomeIndex: number };
+
 type Dispatcher = unknown;
 const dispatcherCache = new Map<string, Dispatcher>();
-
 async function getDispatcher(proxyUrl: string): Promise<Dispatcher | undefined> {
   if (!proxyUrl) return undefined;
   if (dispatcherCache.has(proxyUrl)) return dispatcherCache.get(proxyUrl);
@@ -35,7 +43,6 @@ async function getDispatcher(proxyUrl: string): Promise<Dispatcher | undefined> 
     return undefined;
   }
 }
-
 function extraHeaders(json: string): Record<string, string> {
   if (!json.trim()) return {};
   try {
@@ -45,74 +52,101 @@ function extraHeaders(json: string): Record<string, string> {
     return {};
   }
 }
+function parseJsonArray(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const p = JSON.parse(value);
+      return Array.isArray(p) ? p : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+export function normalizeMarket(m: Record<string, unknown>): MarketInfo {
+  return {
+    conditionId: String(m.conditionId ?? ""),
+    question: String(m.question ?? "Unknown Market"),
+    slug: String(m.slug ?? ""),
+    outcomes: parseJsonArray(m.outcomes).map(String),
+    outcomePrices: parseJsonArray(m.outcomePrices).map(Number),
+    clobTokenIds: parseJsonArray(m.clobTokenIds).map(String),
+    volumeUsd: Number(m.volumeNum ?? m.volume ?? 0),
+    liquidityUsd: Number(m.liquidityNum ?? m.liquidity ?? 0),
+    closed: Boolean(m.closed),
+    active: m.active === undefined ? true : Boolean(m.active),
+    acceptingOrders: m.acceptingOrders === undefined ? !Boolean(m.closed) : Boolean(m.acceptingOrders),
+    umaResolutionStatus: m.umaResolutionStatus ? String(m.umaResolutionStatus) : null,
+    endDate: (m.endDate as string | undefined) ?? null,
+    closedTime: (m.closedTime as string | undefined) ?? null,
+    bestBid: m.bestBid !== undefined ? Number(m.bestBid) : null,
+    bestAsk: m.bestAsk !== undefined ? Number(m.bestAsk) : null,
+    eventSlug: Array.isArray(m.events) && m.events[0] ? String((m.events[0] as { slug?: string }).slug ?? "") : "",
+  };
+}
+
+export function normalizeTrade(t: unknown): WhaleTrade {
+  const x = t as Record<string, unknown>;
+  const idx = Number(x.outcomeIndex);
+  return {
+    proxyWallet: x.proxyWallet ? String(x.proxyWallet).toLowerCase() : undefined,
+    side: String(x.side ?? "BUY").toUpperCase() === "SELL" ? "SELL" : "BUY",
+    asset: String(x.asset ?? x.tokenId ?? ""),
+    conditionId: String(x.conditionId ?? ""),
+    price: Number(x.price ?? 0),
+    size: Number(x.size ?? 0),
+    timestamp: Number(x.timestamp ?? 0),
+    title: String(x.title ?? x.question ?? ""),
+    outcome: String(x.outcome ?? ""),
+    // data-api иногда отдаёт outcomeIndex = 999 → считаем неизвестным
+    outcomeIndex: Number.isFinite(idx) && idx >= 0 && idx < 50 ? idx : undefined,
+    transactionHash: x.transactionHash ? String(x.transactionHash) : undefined,
+    name: x.name ? String(x.name) : undefined,
+    pseudonym: x.pseudonym ? String(x.pseudonym) : undefined,
+  };
+}
 
 export class PolymarketClient {
   private readonly log: (msg: string) => void;
   private lastRequestAt = 0;
   public blockedCount = 0;
+  private marketCache = new Map<string, { at: number; m: MarketInfo | null }>();
 
   constructor(private readonly opts: HttpOptions) {
     this.log = opts.log ?? (() => {});
   }
-
-  get dataApi() {
-    return this.opts.settings.dataApiUrl.replace(/\/$/, "");
-  }
-  get gammaApi() {
-    return this.opts.settings.gammaApiUrl.replace(/\/$/, "");
-  }
-  get clobApi() {
-    return this.opts.settings.clobApiUrl.replace(/\/$/, "");
-  }
+  get dataApi() { return this.opts.settings.dataApiUrl.replace(/\/$/, ""); }
+  get gammaApi() { return this.opts.settings.gammaApiUrl.replace(/\/$/, ""); }
+  get clobApi() { return this.opts.settings.clobApiUrl.replace(/\/$/, ""); }
 
   async fetchJson<T = unknown>(url: string, { retries = 3, timeoutMs = 15_000 } = {}): Promise<T | null> {
     const headers = { ...BROWSER_HEADERS, ...extraHeaders(this.opts.settings.extraHeadersJson) };
     const dispatcher = await getDispatcher(this.opts.settings.httpProxyUrl);
-
     for (let attempt = 0; attempt <= retries; attempt++) {
-      // мягкий rate-limit между запросами
       const wait = this.opts.settings.requestDelayMs - (Date.now() - this.lastRequestAt);
       if (wait > 0) await sleep(wait);
       this.lastRequestAt = Date.now();
-
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const init: RequestInit & { dispatcher?: Dispatcher } = {
-          headers,
-          signal: controller.signal,
-          cache: "no-store",
-        };
+        const init: RequestInit & { dispatcher?: Dispatcher } = { headers, signal: controller.signal, cache: "no-store" };
         if (dispatcher) init.dispatcher = dispatcher;
         const res = await fetch(url, init);
-
-        if (res.status === 429 || res.status === 425) {
-          const backoff = 5_000 * (attempt + 1);
-          this.log(`⏳ ${res.status} rate-limit → ждём ${backoff / 1000}с (${url.split("?")[0]})`);
-          await sleep(backoff);
-          continue;
-        }
+        if (res.status === 429 || res.status === 425) { await sleep(5_000 * (attempt + 1)); continue; }
         if (res.status === 401 || res.status === 403) {
           this.blockedCount++;
-          const backoff = 3_000 * (attempt + 1);
-          this.log(
-            `🚫 HTTP ${res.status} от ${new URL(url).host} — доступ заблокирован (гео/IP-блок Cloudflare). ` +
-              (attempt < retries
-                ? `Повтор через ${backoff / 1000}с…`
-                : "Укажи HTTP-прокси в Настройках → Сеть или альтернативный base-URL.")
-          );
-          if (attempt < retries) {
-            await sleep(backoff);
-            continue;
-          }
+          if (attempt < retries) { await sleep(3_000 * (attempt + 1)); continue; }
+          this.log(`🚫 HTTP ${res.status} от ${new URL(url).host} — гео/IP-блок. Укажи прокси в Настройках → Сеть.`);
           return null;
         }
+        if (res.status === 404) return null;
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return (await res.json()) as T;
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
         const last = attempt === retries;
-        this.log(`⚠️  ${last ? "Ошибка" : "Повтор"} ${url.split("?")[0]}: ${message}`);
+        this.log(`⚠️  ${last ? "Ошибка" : "Повтор"} ${url.split("?")[0]}: ${(err as Error).message}`);
         if (last) return null;
         await sleep(2_000 * (attempt + 1));
       } finally {
@@ -122,124 +156,120 @@ export class PolymarketClient {
     return null;
   }
 
-  /** Сделки трейдера: /trades, при неудаче — /activity?type=TRADE */
+  // ── Сделки / активность ──
   async fetchWhaleTrades(address: string, limit = 50): Promise<WhaleTrade[]> {
-    const primary = await this.fetchJson<unknown[]>(`${this.dataApi}/trades?user=${address}&limit=${limit}`, {
-      retries: 2,
-    });
-    if (Array.isArray(primary) && primary.length) return primary.map(normalizeTrade);
-
-    const fallback = await this.fetchJson<unknown[]>(
-      `${this.dataApi}/activity?user=${address}&limit=${limit}&type=TRADE`,
-      { retries: 1 }
-    );
-    if (Array.isArray(fallback)) return fallback.map(normalizeTrade).filter((t) => t.conditionId);
-    return Array.isArray(primary) ? primary.map(normalizeTrade) : [];
+    const primary = await this.fetchJson<unknown[]>(`${this.dataApi}/trades?user=${address}&limit=${limit}`, { retries: 2 });
+    if (Array.isArray(primary) && primary.length) return dedupeTrades(primary.map(normalizeTrade));
+    const fallback = await this.fetchJson<unknown[]>(`${this.dataApi}/activity?user=${address}&limit=${limit}&type=TRADE`, { retries: 1 });
+    if (Array.isArray(fallback)) return dedupeTrades(fallback.map(normalizeTrade).filter((t) => t.conditionId));
+    return [];
   }
-
-  /** Последние сделки по всей бирже (для поиска китов) */
   async fetchRecentTrades(limit = 500): Promise<WhaleTrade[]> {
     const data = await this.fetchJson<unknown[]>(`${this.dataApi}/trades?limit=${limit}`);
     return Array.isArray(data) ? data.map(normalizeTrade) : [];
   }
-
-  async fetchMarket(conditionId: string): Promise<MarketInfo | null> {
-    const data = await this.fetchJson<Record<string, unknown>[]>(
-      `${this.gammaApi}/markets?condition_ids=${conditionId}`
-    );
-    const m = Array.isArray(data) ? data[0] : null;
-    if (!m || String(m.conditionId ?? "").toLowerCase() !== conditionId.toLowerCase()) return null;
-    return {
-      conditionId: String(m.conditionId),
-      question: String(m.question ?? "Unknown Market"),
-      outcomes: parseJsonArray(m.outcomes).map(String),
-      outcomePrices: parseJsonArray(m.outcomePrices).map(Number),
-      clobTokenIds: parseJsonArray(m.clobTokenIds).map(String),
-      volumeUsd: Number(m.volumeNum ?? m.volume ?? 0),
-      liquidityUsd: Number(m.liquidityNum ?? m.liquidity ?? 0),
-      closed: Boolean(m.closed),
-      endDate: (m.endDate as string | undefined) ?? null,
-    };
+  /** Реальные позиции кошелька (то, что кит держит СЕЙЧАС, а не только последние сделки) */
+  async fetchUserPositions(address: string, limit = 100): Promise<UserPosition[]> {
+    const data = await this.fetchJson<Record<string, unknown>[]>(`${this.dataApi}/positions?user=${address}&limit=${limit}&sortBy=CURRENT&sortDirection=DESC`);
+    return Array.isArray(data)
+      ? data.map((p) => ({
+          conditionId: String(p.conditionId ?? ""), asset: String(p.asset ?? ""), title: String(p.title ?? ""), outcome: String(p.outcome ?? ""),
+          size: Number(p.size ?? 0), avgPrice: Number(p.avgPrice ?? 0), curPrice: Number(p.curPrice ?? 0), cashPnl: Number(p.cashPnl ?? 0), percentPnl: Number(p.percentPnl ?? 0), redeemable: Boolean(p.redeemable),
+        }))
+      : [];
   }
-
-  /** Средняя цена токена: CLOB midpoint → CLOB price → null */
-  async fetchMidPrice(tokenId: string): Promise<number | null> {
-    const mid = await this.fetchJson<{ mid?: string }>(`${this.clobApi}/midpoint?token_id=${tokenId}`, {
-      retries: 1,
-    });
-    const midNum = mid ? parseFloat(String(mid.mid)) : NaN;
-    if (Number.isFinite(midNum) && midNum > 0) return midNum;
-
-    const px = await this.fetchJson<{ price?: string }>(`${this.clobApi}/price?token_id=${tokenId}&side=SELL`, {
-      retries: 1,
-    });
-    const pxNum = px ? parseFloat(String(px.price)) : NaN;
-    return Number.isFinite(pxNum) && pxNum > 0 ? pxNum : null;
-  }
-
-  /** Поиск рынков с потенциальным арбитражем: Yes + No < 1 */
-  async fetchMarketsForArb(minVolumeUsd: number): Promise<MarketInfo[]> {
-    // gamma-api: ищем активные рынки с двухисходными исходами
-    const data = await this.fetchJson<Record<string, unknown>[]>(
-      `${this.gammaApi}/markets?closed=false&limit=100&order=volumeNum&ascending=false`
-    );
+  /** Крупнейшие держатели исходов рынка */
+  async fetchHolders(conditionId: string, limit = 20): Promise<Holder[]> {
+    const data = await this.fetchJson<{ token: string; holders: Record<string, unknown>[] }[]>(`${this.dataApi}/holders?market=${conditionId}&limit=${limit}`);
     if (!Array.isArray(data)) return [];
-    return data
-      .map((m) => ({
-        conditionId: String(m.conditionId ?? ""),
-        question: String(m.question ?? "Unknown"),
-        outcomes: parseJsonArray(m.outcomes).map(String),
-        outcomePrices: parseJsonArray(m.outcomePrices).map(Number),
-        clobTokenIds: parseJsonArray(m.clobTokenIds).map(String),
-        volumeUsd: Number(m.volumeNum ?? m.volume ?? 0),
-        liquidityUsd: Number(m.liquidityNum ?? m.liquidity ?? 0),
-        closed: Boolean(m.closed),
-        endDate: (m.endDate as string | undefined) ?? null,
-      }))
-      .filter(
-        (m) =>
-          !m.closed &&
-          m.outcomes.length === 2 &&
-          m.outcomePrices.length === 2 &&
-          m.volumeUsd >= minVolumeUsd &&
-          m.clobTokenIds.length === 2
-      );
+    return data.flatMap((g) => (g.holders ?? []).map((h) => ({ proxyWallet: String(h.proxyWallet ?? ""), name: String(h.name ?? h.pseudonym ?? ""), amount: Number(h.amount ?? 0), outcomeIndex: Number(h.outcomeIndex ?? 0) })));
   }
 
-  /** Получить все активные рынки для свободного плавания (с фильтром по дате) */
+  // ── Рынки ──
+  async fetchMarket(conditionId: string, maxAgeMs = 20_000): Promise<MarketInfo | null> {
+    const c = this.marketCache.get(conditionId);
+    if (c && Date.now() - c.at < maxAgeMs) return c.m;
+    const data = await this.fetchJson<Record<string, unknown>[]>(`${this.gammaApi}/markets?condition_ids=${conditionId}`);
+    const raw = Array.isArray(data) ? data[0] : null;
+    const m = raw && String(raw.conditionId ?? "").toLowerCase() === conditionId.toLowerCase() ? normalizeMarket(raw) : null;
+    this.marketCache.set(conditionId, { at: Date.now(), m });
+    return m;
+  }
+  async fetchMarketBySlug(slug: string): Promise<MarketInfo | null> {
+    const data = await this.fetchJson<Record<string, unknown>[]>(`${this.gammaApi}/markets?slug=${encodeURIComponent(slug)}`);
+    return Array.isArray(data) && data[0] ? normalizeMarket(data[0]) : null;
+  }
+  /** Поиск рынков по тексту (public-search) с фолбэком на фильтрацию активных */
+  async searchMarkets(query: string, limit = 20): Promise<MarketInfo[]> {
+    const data = await this.fetchJson<{ events?: { markets?: Record<string, unknown>[] }[] }>(`${this.gammaApi}/public-search?q=${encodeURIComponent(query)}&limit_per_type=${limit}`);
+    const fromSearch = (data?.events ?? []).flatMap((e) => e.markets ?? []).map(normalizeMarket).filter((m) => !m.closed);
+    if (fromSearch.length) return fromSearch.slice(0, limit);
+    const all = await this.fetchActiveMarkets(200, 0, 365);
+    const q = query.toLowerCase();
+    return all.filter((m) => m.question.toLowerCase().includes(q)).slice(0, limit);
+  }
   async fetchActiveMarkets(limit = 100, minVolume = 10000, maxDaysToEnd = 30): Promise<MarketInfo[]> {
     const now = new Date().toISOString();
     const maxDate = new Date(Date.now() + maxDaysToEnd * 86400_000).toISOString();
-    const data = await this.fetchJson<Record<string, unknown>[]>(
-      `${this.gammaApi}/markets?closed=false&end_date_min=${now}&end_date_max=${maxDate}&limit=${limit}&order=volumeNum&ascending=false`
-    );
+    const data = await this.fetchJson<Record<string, unknown>[]>(`${this.gammaApi}/markets?closed=false&active=true&end_date_min=${now}&end_date_max=${maxDate}&limit=${limit}&order=volumeNum&ascending=false`);
     if (!Array.isArray(data)) return [];
     const maxTs = Date.now() + maxDaysToEnd * 86400_000;
-    return data
-      .map((m) => ({
-        conditionId: String(m.conditionId ?? ""),
-        question: String(m.question ?? "Unknown"),
-        outcomes: parseJsonArray(m.outcomes).map(String),
-        outcomePrices: parseJsonArray(m.outcomePrices).map(Number),
-        clobTokenIds: parseJsonArray(m.clobTokenIds).map(String),
-        volumeUsd: Number(m.volumeNum ?? m.volume ?? 0),
-        liquidityUsd: Number(m.liquidityNum ?? m.liquidity ?? 0),
-        closed: Boolean(m.closed),
-        endDate: (m.endDate as string | undefined) ?? null,
-      }))
-      .filter((m) => {
-        if (m.closed) return false;
-        if (m.outcomePrices.length < 2) return false;
-        if (m.volumeUsd < minVolume) return false;
-        // Фильтр по времени: пропускаем рынки с датой окончания > maxDaysToEnd дней
-        if (m.endDate) {
-          const endTs = new Date(m.endDate).getTime();
-          if (endTs > maxTs || endTs < Date.now()) return false;
-        }
-        return true;
-      });
+    return data.map(normalizeMarket).filter((m) => {
+      if (m.closed || !m.acceptingOrders || m.outcomePrices.length < 2 || m.volumeUsd < minVolume) return false;
+      if (m.endDate) { const e = new Date(m.endDate).getTime(); if (e > maxTs || e < Date.now()) return false; }
+      return true;
+    });
+  }
+  async fetchMarketsForArb(minVolumeUsd: number): Promise<MarketInfo[]> {
+    const data = await this.fetchJson<Record<string, unknown>[]>(`${this.gammaApi}/markets?closed=false&active=true&limit=100&order=volumeNum&ascending=false`);
+    if (!Array.isArray(data)) return [];
+    return data.map(normalizeMarket).filter((m) => !m.closed && m.acceptingOrders && m.outcomes.length === 2 && m.clobTokenIds.length === 2 && m.volumeUsd >= minVolumeUsd);
   }
 
+  // ── CLOB: цены ──
+  async fetchMidPrice(tokenId: string): Promise<number | null> {
+    const mid = await this.fetchJson<{ mid?: string }>(`${this.clobApi}/midpoint?token_id=${tokenId}`, { retries: 1 });
+    const midNum = mid ? parseFloat(String(mid.mid)) : NaN;
+    if (Number.isFinite(midNum) && midNum > 0) return midNum;
+    const px = await this.fetchJson<{ price?: string }>(`${this.clobApi}/price?token_id=${tokenId}&side=SELL`, { retries: 1 });
+    const pxNum = px ? parseFloat(String(px.price)) : NaN;
+    return Number.isFinite(pxNum) && pxNum > 0 ? pxNum : null;
+  }
+  /** Стакан: нужен для честного paper-исполнения (проскальзывание) и для оценки ликвидности */
+  async fetchOrderBook(tokenId: string): Promise<OrderBook | null> {
+    const b = await this.fetchJson<{ bids?: { price: string; size: string }[]; asks?: { price: string; size: string }[] }>(`${this.clobApi}/book?token_id=${tokenId}`, { retries: 1 });
+    if (!b) return null;
+    const bids = (b.bids ?? []).map((x) => ({ price: Number(x.price), size: Number(x.size) })).sort((a, c) => c.price - a.price);
+    const asks = (b.asks ?? []).map((x) => ({ price: Number(x.price), size: Number(x.size) })).sort((a, c) => a.price - c.price);
+    const bestBid = bids[0]?.price ?? 0, bestAsk = asks[0]?.price ?? 1;
+    const depthUsd = asks.slice(0, 5).reduce((s, a) => s + a.price * a.size, 0);
+    return { tokenId, bids, asks, bestBid, bestAsk, spread: bestAsk - bestBid, depthUsd };
+  }
+  /** Средняя цена исполнения маркет-ордера на $usd по стакану (walk the book) */
+  async estimateFill(tokenId: string, side: "BUY" | "SELL", usdOrShares: number): Promise<{ avgPrice: number; filled: number; slippage: number } | null> {
+    const book = await this.fetchOrderBook(tokenId);
+    if (!book) return null;
+    const levels = side === "BUY" ? book.asks : book.bids;
+    const ref = side === "BUY" ? book.bestAsk : book.bestBid;
+    let remaining = usdOrShares, cost = 0, shares = 0;
+    for (const l of levels) {
+      if (remaining <= 0) break;
+      if (side === "BUY") {
+        const take = Math.min(remaining, l.price * l.size);
+        shares += take / l.price; cost += take; remaining -= take;
+      } else {
+        const take = Math.min(remaining, l.size);
+        shares += take; cost += take * l.price; remaining -= take;
+      }
+    }
+    if (shares <= 0) return null;
+    const avg = cost / shares;
+    return { avgPrice: avg, filled: side === "BUY" ? cost : shares, slippage: Math.abs(avg - ref) };
+  }
+  async fetchPriceHistory(tokenId: string, interval: "1h" | "6h" | "1d" | "1w" | "max" = "1d", fidelity = 5): Promise<PricePoint[]> {
+    const d = await this.fetchJson<{ history?: { t: number; p: number }[] }>(`${this.clobApi}/prices-history?market=${tokenId}&interval=${interval}&fidelity=${fidelity}`, { retries: 1 });
+    return d?.history ?? [];
+  }
   async ping(): Promise<{ dataApi: boolean; gammaApi: boolean; clobApi: boolean }> {
     const [a, b, c] = await Promise.all([
       this.fetchJson(`${this.dataApi}/trades?limit=1`, { retries: 0 }),
@@ -250,82 +280,27 @@ export class PolymarketClient {
   }
 }
 
-function parseJsonArray(value: unknown): unknown[] {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== "string") return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+/** data-api иногда возвращает одну и ту же сделку дважды (разные страницы/дубль индексатора) */
+function dedupeTrades(ts: WhaleTrade[]): WhaleTrade[] {
+  const seen = new Set<string>();
+  return ts.filter((t) => {
+    const k = t.transactionHash ? `${t.transactionHash}:${t.asset}:${t.side}` : `${t.asset}:${t.side}:${t.timestamp}:${t.size}:${t.price}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
-function normalizeTrade(raw: unknown): WhaleTrade {
-  const t = (raw ?? {}) as Record<string, unknown>;
-  return {
-    proxyWallet: t.proxyWallet ? String(t.proxyWallet) : undefined,
-    side: String(t.side ?? "BUY").toUpperCase() === "SELL" ? "SELL" : "BUY",
-    asset: String(t.asset ?? ""),
-    conditionId: String(t.conditionId ?? ""),
-    price: Number(t.price ?? 0),
-    size: Number(t.size ?? 0),
-    timestamp: Number(t.timestamp ?? 0),
-    title: String(t.title ?? ""),
-    outcome: String(t.outcome ?? ""),
-    outcomeIndex: t.outcomeIndex !== undefined ? Number(t.outcomeIndex) : undefined,
-    transactionHash: t.transactionHash ? String(t.transactionHash) : undefined,
-    name: t.name ? String(t.name) : undefined,
-    pseudonym: t.pseudonym ? String(t.pseudonym) : undefined,
-  };
-}
-
-export type WhaleCandidate = {
-  wallet: string;
-  name: string;
-  trades: number;
-  volumeUsd: number;
-  markets: string[];
-  buyRatio: number;
-  avgPrice: number;
-};
-
-export function aggregateWhales(trades: WhaleTrade[], top = 25): WhaleCandidate[] {
-  const byWallet = new Map<string, WhaleCandidate & { buys: number; priceSum: number; marketSet: Set<string> }>();
+export function aggregateWhales(trades: WhaleTrade[], minTrades = 10): { address: string; name: string; trades: number; volumeUsd: number; lastTrade: number }[] {
+  const map = new Map<string, { address: string; name: string; trades: number; volumeUsd: number; lastTrade: number }>();
   for (const t of trades) {
-    const w = t.proxyWallet;
-    if (!w) continue;
-    const s =
-      byWallet.get(w) ??
-      {
-        wallet: w,
-        name: t.name || t.pseudonym || "",
-        trades: 0,
-        volumeUsd: 0,
-        markets: [],
-        buyRatio: 0,
-        avgPrice: 0,
-        buys: 0,
-        priceSum: 0,
-        marketSet: new Set<string>(),
-      };
-    s.trades++;
-    s.volumeUsd += t.size * t.price;
-    s.priceSum += t.price;
-    if (t.side === "BUY") s.buys++;
-    if (t.title) s.marketSet.add(t.title);
-    byWallet.set(w, s);
+    const addr = t.proxyWallet;
+    if (!addr) continue;
+    const cur = map.get(addr) ?? { address: addr, name: t.name || t.pseudonym || (addr.slice(0, 8) + "…"), trades: 0, volumeUsd: 0, lastTrade: 0 };
+    cur.trades++;
+    cur.volumeUsd += t.size * t.price;
+    cur.lastTrade = Math.max(cur.lastTrade, t.timestamp);
+    map.set(addr, cur);
   }
-  return [...byWallet.values()]
-    .map((s) => ({
-      wallet: s.wallet,
-      name: s.name,
-      trades: s.trades,
-      volumeUsd: s.volumeUsd,
-      markets: [...s.marketSet].slice(0, 3),
-      buyRatio: s.trades ? s.buys / s.trades : 0,
-      avgPrice: s.trades ? s.priceSum / s.trades : 0,
-    }))
-    .sort((a, b) => b.volumeUsd - a.volumeUsd)
-    .slice(0, top);
+  return [...map.values()].filter((w) => w.trades >= minTrades).sort((a, b) => b.volumeUsd - a.volumeUsd);
 }
