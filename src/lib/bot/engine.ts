@@ -601,9 +601,9 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
         bet = Math.min(
           Math.round(bet * mult * 100) / 100,
           strategy.maxBetUsd,
-          ctx.portfolio.cashUsd * strategy.maxBetPct,
           ctx.portfolio.cashUsd
         );
+        if (ctx.portfolio.cashUsd >= 1 && bet < 1 && strategy.maxBetUsd >= 1) bet = 1;
       }
       if (exposure + bet > budget) { await ctx.log("info", `   ⏭️ ставка ${usd(bet)} превысит лимит категории`); continue; }
 
@@ -723,6 +723,7 @@ export function calcBet(s: Strategy, price: number, cashUsd: number, whaleUsd: n
   if (bet <= 0) return 0;
   bet = Math.max(cashUsd * s.minBetPct, Math.min(bet, cashUsd * s.maxBetPct));
   bet = Math.min(bet, s.maxBetUsd, cashUsd);
+  if (cashUsd >= 1 && bet < 1 && s.maxBetUsd >= 1) bet = 1;
   return Math.floor(bet * 100) / 100;
 }
 

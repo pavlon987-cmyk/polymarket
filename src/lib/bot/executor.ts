@@ -1,6 +1,7 @@
 import type { Settings } from "@/db/schema";
 import { PolymarketClient } from "./polymarket";
 import type { TradingMode } from "./types";
+import { executeClobV2Order, syncBalanceAllowance, type ApiCreds } from "./clob-v2";
 
 export type BuyResult = {
   ok: boolean;
@@ -154,64 +155,48 @@ export async function getOnChainCollateralBalance(address: string): Promise<numb
 export class LiveExecutor implements Executor {
   readonly mode: TradingMode = "live";
 
-  private client: any | null = null;
-  private mod: any | null = null;
-
-  public creds: { key: string; secret: string; passphrase: string } | null = null;
+  private signer: any | null = null;
+  private funder: string = "";
+  private host: string = "https://clob.polymarket.com";
+  private chainId: number = 137;
+  public creds: ApiCreds | null = null;
 
   constructor(private readonly settings: Settings, private readonly log: (m: string) => void) {}
 
-  private async getClient(): Promise<any> {
-    if (this.client) return this.client;
+  private async getCredsAndSigner(): Promise<{ signer: any; funder: string; creds: ApiCreds; host: string; chainId: number }> {
+    if (this.signer && this.creds) {
+      return { signer: this.signer, funder: this.funder, creds: this.creds, host: this.host, chainId: this.chainId };
+    }
 
     const readiness = liveReadiness(this.settings);
     if (!readiness.ready) throw new Error(`Live-режим не готов: ${readiness.reasons.join("; ")}`);
 
-    const mod: any = await import("@polymarket/clob-client");
-    const ethers: any = await import("ethers");
-    this.mod = mod;
+    const { ClobClient } = await import("@polymarket/clob-client");
+    const { ethers } = await import("ethers");
 
-    const host = this.settings.clobApiUrl || "https://clob.polymarket.com";
-    const chainId = Number(process.env.POLYMARKET_CHAIN_ID ?? 137);
+    this.host = this.settings.clobApiUrl || "https://clob.polymarket.com";
+    this.chainId = Number(process.env.POLYMARKET_CHAIN_ID ?? 137);
 
-    const signer = new ethers.Wallet(process.env.POLYMARKET_PRIVATE_KEY as string);
-    const signatureType = Number(process.env.POLYMARKET_SIGNATURE_TYPE ?? 2);
-    const funder = process.env.POLYMARKET_FUNDER_ADDRESS as string;
+    this.signer = new ethers.Wallet(process.env.POLYMARKET_PRIVATE_KEY as string);
+    this.funder = (process.env.POLYMARKET_FUNDER_ADDRESS as string).trim();
 
-    const tmp = new mod.ClobClient(host, chainId, signer);
-    const creds = await tmp.createOrDeriveApiKey();
+    const tmp = new ClobClient(this.host, this.chainId, this.signer);
+    this.creds = await tmp.createOrDeriveApiKey();
 
-    this.client = new mod.ClobClient(host, chainId, signer, creds, signatureType, funder);
-    this.creds = creds;
-
-    this.log(`🔐 CLOB-клиент готов (signer ${signer.address.slice(0, 10)}…, funder ${funder.slice(0, 10)}…)`);
-    return this.client;
+    this.log(`🔐 CLOB V2 клиент готов (signer ${this.signer.address.slice(0, 10)}…, funder ${this.funder.slice(0, 10)}…)`);
+    return { signer: this.signer, funder: this.funder, creds: this.creds, host: this.host, chainId: this.chainId };
   }
 
   async balanceUsd(): Promise<number | null> {
     try {
-      const client = await this.getClient();
-      const res = await client.getBalanceAllowance({ asset_type: this.mod.AssetType.COLLATERAL });
+      const { signer, funder, creds, host } = await this.getCredsAndSigner();
+      await syncBalanceAllowance(host, signer, creds);
 
-      // ФИКС: нормализуем (может быть string/base units)
-      let bal = parseClobAmount(res?.balance ?? 0);
-
-      // Если CLOB API вернул 0 (средства в pUSD или кэш ещё не обновился),
-      // проверяем прямой on-chain баланс на Polygon (pUSD / USDC.e / USDC) для funder адреса:
-      if (!bal || bal <= 0) {
-        const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
-        if (funder) {
-          const onChainBal = await getOnChainCollateralBalance(funder);
-          if (onChainBal !== null) {
-            bal = onChainBal;
-          } else {
-            // RPC недоступны — возвращаем null, чтобы не обнулять кэш и не триггерить ложный стоп-лосс
-            return null;
-          }
-        }
+      const onChainBal = await getOnChainCollateralBalance(funder);
+      if (onChainBal !== null && Number.isFinite(onChainBal)) {
+        return onChainBal;
       }
-
-      return Number.isFinite(bal) ? bal : null;
+      return null;
     } catch (err) {
       const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
       if (funder) {
@@ -229,7 +214,7 @@ export class LiveExecutor implements Executor {
 
   async buy({ tokenId, price, usd, market }: { tokenId: string; price: number; usd: number; market: string }): Promise<BuyResult> {
     try {
-      const client = await this.getClient();
+      const { signer, funder, creds, host, chainId } = await this.getCredsAndSigner();
 
       const amountUsd = r2(usd);
       if (amountUsd < 1) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: "Минимальный ордер $1" };
@@ -237,24 +222,28 @@ export class LiveExecutor implements Executor {
       // небольшой буфер к цене, чтобы FOK чаще проходил
       const limitPx = Math.min(0.99, r2(price + 0.02));
 
-      // BUY: amount = USDC
-      const order = await client.createMarketOrder({
-        side: this.mod.Side.BUY,
-        tokenID: tokenId,
+      const resp = await executeClobV2Order({
+        host,
+        chainId,
+        signer,
+        funder,
+        creds,
+        tokenId,
+        side: "BUY",
         amount: amountUsd,
         price: limitPx,
+        orderType: "FOK",
       });
 
-      const resp = await client.postOrder(order, this.mod.OrderType.FOK);
-      if (!resp?.success) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: resp?.errorMsg || JSON.stringify(resp) };
+      if (!resp.ok) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: resp.error };
 
       const costUsd = parseClobAmount(resp.makingAmount) || amountUsd;
       const shares = parseClobAmount(resp.takingAmount) || (limitPx > 0 ? costUsd / limitPx : 0);
 
-      if (!(shares > 0)) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: `BUY success, но takingAmount=0 (order ${resp.orderID})` };
+      if (!(shares > 0)) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: `BUY success, но takingAmount=0 (order ${resp.orderId})` };
 
-      this.log(`💸 LIVE BUY ${market.slice(0, 40)} — ${shares.toFixed(2)} шт. за $${costUsd.toFixed(2)} (order ${resp.orderID})`);
-      return { ok: true, shares, avgPrice: costUsd / shares, costUsd, orderId: String(resp.orderID ?? "") };
+      this.log(`💸 LIVE BUY ${market.slice(0, 40)} — ${shares.toFixed(2)} шт. за $${costUsd.toFixed(2)} (order ${resp.orderId})`);
+      return { ok: true, shares, avgPrice: costUsd / shares, costUsd, orderId: String(resp.orderId ?? "") };
     } catch (err) {
       return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: (err as Error).message };
     }
@@ -262,36 +251,39 @@ export class LiveExecutor implements Executor {
 
   async sell({ tokenId, shares, price, market }: { tokenId: string; shares: number; price: number; market: string }): Promise<SellResult> {
     try {
-      const client = await this.getClient();
+      const { signer, funder, creds, host, chainId } = await this.getCredsAndSigner();
 
       const size = r2(shares); // SELL: amount = shares
       if (size < 1) return { ok: false, proceedsUsd: 0, avgPrice: price, error: "Меньше 1 акции — нечего продавать (дождись резолва и redeem)" };
 
       const limitPx = Math.max(0.01, r2(price - 0.02));
 
-      // SELL: amount = shares
-      const order = await client.createMarketOrder({
-        side: this.mod.Side.SELL,
-        tokenID: tokenId,
+      const resp = await executeClobV2Order({
+        host,
+        chainId,
+        signer,
+        funder,
+        creds,
+        tokenId,
+        side: "SELL",
         amount: size,
         price: limitPx,
+        orderType: "FOK",
       });
 
-      // ФИКС: убран GTC fallback — сейчас у проекта нет учёта pending/partial fills в positions,
-      // поэтому GTC делает рассинхрон (ордер стоит, позиция OPEN, дальше повторные sell и т.п.).
-      const resp = await client.postOrder(order, this.mod.OrderType.FOK);
-      if (!resp?.success) return { ok: false, proceedsUsd: 0, avgPrice: price, error: resp?.errorMsg || JSON.stringify(resp) };
+      if (!resp.ok) return { ok: false, proceedsUsd: 0, avgPrice: price, error: resp.error };
 
       const proceedsUsd = parseClobAmount(resp.takingAmount) || size * limitPx;
       const avgPrice = proceedsUsd / size;
 
-      this.log(`📤 LIVE SELL ${market.slice(0, 40)} — ${size} шт. за $${proceedsUsd.toFixed(2)} (order ${resp.orderID})`);
-      return { ok: true, proceedsUsd, avgPrice, orderId: String(resp.orderID ?? "") };
+      this.log(`📤 LIVE SELL ${market.slice(0, 40)} — ${size} шт. за $${proceedsUsd.toFixed(2)} (order ${resp.orderId})`);
+      return { ok: true, proceedsUsd, avgPrice, orderId: String(resp.orderId ?? "") };
     } catch (err) {
       return { ok: false, proceedsUsd: 0, avgPrice: price, error: (err as Error).message };
     }
   }
 }
+
 
 export type LiveReadiness = {
   ready: boolean;
