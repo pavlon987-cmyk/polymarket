@@ -115,15 +115,21 @@ export async function persistNewsEvents(events: NormalizedNews[]) {
 
 import { desc, gte } from "drizzle-orm";
 
-export async function getRecentNews(lookbackSeconds: number = 600) {
+export async function getRecentNews(lookbackSeconds: number = 86400) {
   try {
     const since = new Date(Date.now() - lookbackSeconds * 1000);
-    return await db
+    const rows = await db
       .select()
       .from(newsEvents)
       .where(gte(newsEvents.publishedAt, since))
       .orderBy(desc(newsEvents.publishedAt))
       .limit(30);
+    if (rows.length > 0) return rows;
+    return await db
+      .select()
+      .from(newsEvents)
+      .orderBy(desc(newsEvents.publishedAt))
+      .limit(20);
   } catch {
     return [];
   }
