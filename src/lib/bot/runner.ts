@@ -2,6 +2,7 @@ import { runCycle, isCycleRunning } from "./engine";
 import { addLog, getSettings, updateSettings } from "./store";
 import type { CycleResult } from "./types";
 import { startRiskWorker, stopRiskWorker } from "./risk-worker";
+import { getSpotAggregator } from "./spot-feeds";
 
 type RunnerState = {
   running: boolean;
@@ -58,6 +59,11 @@ export async function startLoop(persist = true, initialDelayMs = 0) {
   if (persist) await updateSettings({ autorun: true });
   await addLog("info", "🟢 Авто-цикл запущен");
   startRiskWorker();
+  try {
+    getSpotAggregator("BTC");
+    getSpotAggregator("ETH");
+    getSpotAggregator("SOL");
+  } catch {}
   s.timer = setTimeout(() => void tick(), initialDelayMs);
   s.timer.unref?.();
   return getRunnerState();

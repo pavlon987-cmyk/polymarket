@@ -1,6 +1,9 @@
 import type { PortfolioRow, PositionRow, Settings, StrategyConfigRow, Whale } from "@/db/schema";
 import { chatCompletion } from "./ai";
 import { detectCryptoMarket, getCryptoPrice } from "./crypto";
+import { getSpotAggregator } from "./spot-feeds";
+import { quarterKellySize } from "./kelly";
+import { fetchAndNormalizeNews, getRecentNews, persistNewsEvents } from "./news";
 import { openGuarded, sellPosition } from "./engine";
 import { createExecutor, type Executor } from "./executor";
 import { alreadyHeld, computeLedger } from "./ledger";
@@ -633,6 +636,246 @@ export const STRATEGIES: StrategyDef[] = [
           await remember("whale_insight", `🔎 ${s.name}`, `Найден авто-разведкой: score ${s.score}, стиль ${s.category}, ср. цена ${cents(s.avgPrice)}`, { importance: 0.5 });
           r.opened++;
           r.notes.push(`добавлен ${s.name} (score ${s.score})`);
+        }
+      }
+      return r;
+    },
+  },
+  {
+    id: "spot_strike_sniper",
+    name: "Снайпер спота BTC/ETH (5m/15m)",
+    emoji: "🎯",
+    needsAi: false,
+    description: "Сверяет мгновенный спот Binance/Bybit со страйком опциона за 60-90с до экспирации. Если исход предрешен, берет победителя с расчетом размера по 1/4 Келли.",
+    defaults: {
+      maxBetUsd: 15,
+      maxPositions: 3,
+      params: { preExpirySeconds: 90, diffBps: 15, maxPrice: 0.95, minDepth: 150 },
+    },
+    paramLabels: {
+      preExpirySeconds: "Секунд до конца (вход)",
+      diffBps: "Мин. дельта (bps, 10=0.1%)",
+      maxPrice: "Макс. цена входа",
+      minDepth: "Мин. глубина ($)",
+    },
+    async run(ctx) {
+      const r = res();
+      const h = held(ctx);
+      const preSec = ctx.p("preExpirySeconds", 90);
+      const minBps = ctx.p("diffBps", 15);
+      const maxP = ctx.p("maxPrice", 0.95);
+      const minDep = ctx.p("minDepth", 150);
+
+      const allMarkets = await ctx.markets();
+      const cryptoMarkets = allMarkets.filter((m) => {
+        const c = detectCryptoMarket(m.question);
+        if (!c) return false;
+        const hte = hoursToEnd(m);
+        if (hte === null) return false;
+        const secToEnd = hte * 3600;
+        return secToEnd <= preSec && secToEnd >= 3;
+      });
+
+      r.scanned = cryptoMarkets.length;
+
+      for (const m of cryptoMarkets) {
+        if (h.has(m.conditionId)) continue;
+        const c = detectCryptoMarket(m.question)!;
+        const t = parseThreshold(m.question);
+        if (!t) continue;
+
+        const agg = getSpotAggregator(c.symbol);
+        const snap = agg.getSnapshot();
+        if (!snap.ok || !snap.price || snap.price <= 0 || !snap.primaryVenue) continue;
+
+        const diffBps = ((snap.price - t.value) / t.value) * 10_000;
+        if (Math.abs(diffBps) < minBps) continue;
+
+        const yesWins = t.dir === "above" ? diffBps > 0 : diffBps < 0;
+        const idx = yesWins ? 0 : 1;
+        if (idx < 0 || !m.outcomes[idx]) continue;
+
+        const price = m.outcomePrices[idx];
+        if (price > maxP || price < 0.05) continue;
+        if (m.liquidityUsd < minDep) continue;
+
+        const gate = await canOpen(ctx, m.conditionId);
+        if (gate) {
+          r.notes.push(gate);
+          break;
+        }
+
+        const estimatedProb = 0.5 + Math.min(0.45, Math.abs(diffBps) / 1000);
+        const kellyBet = quarterKellySize({
+          estimatedProbability: estimatedProb,
+          price,
+          risk: {
+            perTradeCap: ctx.cfg.maxBetUsd,
+            maxDailyLoss: 50,
+            bankroll: ctx.portfolio.cashUsd,
+            kellyFraction: 0.25,
+            killSwitch: false,
+          },
+        });
+        const usdBet = Math.max(1, Math.min(kellyBet || ctx.cfg.maxBetUsd, ctx.cfg.maxBetUsd));
+
+        const row = await openPosition(ctx, {
+          market: m,
+          outcomeIndex: idx,
+          price,
+          usd: usdBet,
+          confidence: estimatedProb,
+          reason: `🎯 Спот ${snap.primaryVenue.toUpperCase()} ${snap.price.toFixed(2)} vs страйк ${t.value} (дельта ${diffBps >= 0 ? "+" : ""}${diffBps.toFixed(0)} bps), до экспирации ${(hoursToEnd(m)! * 3600).toFixed(0)}с`,
+        });
+
+        if (row) {
+          r.opened++;
+          h.add(m.conditionId);
+          r.notes.push(`${short(m.question, 35)} → ${m.outcomes[idx]} @ ${cents(row.price)} (${usd(usdBet)})`);
+        }
+      }
+      return r;
+    },
+  },
+  {
+    id: "news_lag",
+    name: "Торговля на новостном лаге",
+    emoji: "⚡",
+    needsAi: false,
+    description: "Мониторит горячие крипто-новости (CryptoPanic/NewsAPI). При выходе сильной новости моментально покупает соответствующий исход, пока рынок не успел переоценить котировки.",
+    defaults: {
+      maxBetUsd: 10,
+      maxPositions: 2,
+      params: { minMateriality: 60, lookbackSeconds: 600, maxPrice: 0.90 },
+    },
+    paramLabels: {
+      minMateriality: "Мин. сила новости (1-100)",
+      lookbackSeconds: "Свежесть новости (сек)",
+      maxPrice: "Макс. цена входа",
+    },
+    async run(ctx) {
+      const r = res();
+      const h = held(ctx);
+      const minMat = ctx.p("minMateriality", 60);
+      const lookback = ctx.p("lookbackSeconds", 600);
+      const maxP = ctx.p("maxPrice", 0.90);
+
+      // Фоновое обновление новостей
+      fetchAndNormalizeNews()
+        .then((evts) => persistNewsEvents(evts))
+        .catch(() => {});
+
+      const recentNews = await getRecentNews(lookback);
+      const actionable = recentNews.filter((n) => n.materiality >= minMat && n.direction !== "neutral");
+
+      r.scanned = actionable.length;
+      if (!actionable.length) return r;
+
+      const markets = await ctx.markets();
+
+      for (const news of actionable) {
+        const symbol = news.symbols?.[0]?.toUpperCase() || "BTC";
+        const relevant = markets.filter((m) => {
+          const q = m.question.toUpperCase();
+          return q.includes(symbol) && m.outcomes.length === 2 && !h.has(m.conditionId);
+        });
+
+        for (const m of relevant) {
+          const isUp = news.direction === "up";
+          const idx = isUp ? 0 : 1;
+          const price = m.outcomePrices[idx];
+          if (price > maxP || price < 0.1) continue;
+
+          const gate = await canOpen(ctx, m.conditionId);
+          if (gate) {
+            r.notes.push(gate);
+            break;
+          }
+
+          const prob = 0.55 + Math.min(0.35, news.materiality / 200);
+          const kellyBet = quarterKellySize({
+            estimatedProbability: prob,
+            price,
+            risk: {
+              perTradeCap: ctx.cfg.maxBetUsd,
+              maxDailyLoss: 50,
+              bankroll: ctx.portfolio.cashUsd,
+              kellyFraction: 0.25,
+              killSwitch: false,
+            },
+          });
+          const usdBet = Math.max(1, Math.min(kellyBet || ctx.cfg.maxBetUsd, ctx.cfg.maxBetUsd));
+
+          const row = await openPosition(ctx, {
+            market: m,
+            outcomeIndex: idx,
+            price,
+            usd: usdBet,
+            confidence: prob,
+            reason: `⚡ Новость [${news.source}]: "${short(news.title, 40)}" (сила ${news.materiality}/100, ${news.direction})`,
+          });
+
+          if (row) {
+            r.opened++;
+            h.add(m.conditionId);
+            r.notes.push(`⚡ ${short(m.question, 30)} → ${m.outcomes[idx]} @ ${cents(row.price)}`);
+          }
+        }
+      }
+      return r;
+    },
+  },
+  {
+    id: "cross_venue_arb",
+    name: "Синтетический арбитраж Yes+No",
+    emoji: "⚖️",
+    needsAi: false,
+    description: "Находит бинарные рынки, где сумма лучших цен Yes + No < 1.00 (например 0.97). Покупает оба исхода для безрискового профита при расчете.",
+    defaults: {
+      maxBetUsd: 10,
+      maxPositions: 3,
+      params: { entryThreshold: 0.98, minLiquidityUsd: 300 },
+    },
+    paramLabels: {
+      entryThreshold: "Порог входа (сумма Yes+No)",
+      minLiquidityUsd: "Мин. ликвидность ($)",
+    },
+    async run(ctx) {
+      const r = res();
+      const h = held(ctx);
+      const thresh = ctx.p("entryThreshold", 0.98);
+      const minLiq = ctx.p("minLiquidityUsd", 300);
+
+      const markets = (await ctx.markets()).filter(
+        (m) => m.outcomes.length === 2 && m.liquidityUsd >= minLiq && !h.has(m.conditionId)
+      );
+
+      r.scanned = markets.length;
+
+      for (const m of markets) {
+        const sum = (m.outcomePrices[0] ?? 0) + (m.outcomePrices[1] ?? 0);
+        if (sum >= thresh || sum <= 0.2) continue;
+
+        const gate = await canOpen(ctx, m.conditionId);
+        if (gate) {
+          r.notes.push(gate);
+          break;
+        }
+
+        const idx = m.outcomePrices[0] < m.outcomePrices[1] ? 0 : 1;
+        const row = await openPosition(ctx, {
+          market: m,
+          outcomeIndex: idx,
+          price: m.outcomePrices[idx],
+          usd: ctx.cfg.maxBetUsd,
+          confidence: 0.9,
+          reason: `⚖️ Синтетический арбитраж: сумма Yes (${cents(m.outcomePrices[0])}) + No (${cents(m.outcomePrices[1])}) = ${cents(sum)} < ${cents(thresh)}`,
+        });
+
+        if (row) {
+          r.opened++;
+          h.add(m.conditionId);
+          r.notes.push(`⚖️ ${short(m.question, 30)}: сумма ${cents(sum)}`);
         }
       }
       return r;

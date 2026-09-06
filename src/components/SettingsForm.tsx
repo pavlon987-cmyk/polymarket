@@ -12,7 +12,7 @@ type S = Settings & { aiApiKeySet: boolean; telegramBotTokenSet: boolean; httpPr
 type Readiness = { ready: boolean; reasons: string[]; envPresent: { privateKey: boolean; funder: boolean; enabledFlag: boolean } };
 type Resp = { settings: S; liveReadiness: Readiness; defaults: { strategy: Strategy; aiPrompt: string } };
 type NumKey = { [K in keyof S]-?: S[K] extends number ? K : never }[keyof S];
-type StrKey = "dataApiUrl" | "gammaApiUrl" | "clobApiUrl" | "extraHeadersJson" | "aiApiUrl" | "aiModel" | "aiSystemPrompt" | "telegramChatId";
+type StrKey = "dataApiUrl" | "gammaApiUrl" | "clobApiUrl" | "extraHeadersJson" | "aiApiUrl" | "aiModel" | "aiSystemPrompt" | "telegramChatId" | "cryptoPanicToken" | "newsApiKey" | "kalshiApiKeyId" | "kalshiPrivateKey";
 type SecretKey = "aiApiKey" | "telegramBotToken" | "httpProxyUrl";
 type AiTest = { loading?: boolean; ok?: boolean; ms?: number; ping?: string; error?: string; decision?: { decision: string; confidence: number; reason: string } };
 type Ping = { loading?: boolean; dataApi?: boolean; gammaApi?: boolean; clobApi?: boolean; blockedCount?: number; messages?: string[]; proxy?: boolean; error?: string };
@@ -26,6 +26,7 @@ const SECTIONS = [
   { id: "net", label: "Сеть" },
   { id: "telegram", label: "Telegram" },
   { id: "verify", label: "Верификация" },
+  { id: "feeds", label: "Спот и Новости" },
 ];
 
 const AI_PRESETS = [
@@ -428,6 +429,44 @@ export function SettingsForm() {
           {numField("walletMinWinRate", "Мин. доля умных покупок", "0.5 = 50%")}
           {numField("walletMinVolumeUsd", "Мин. объём, $")}
           {numField("walletMaxDrawdownPct", "Макс. drawdown, доля", "0.3 = 30%")}
+        </div>
+      </Card>
+
+      {/* ── Спот-фиды и Новости ── */}
+      <Card id="feeds" title="⚡ Внешние спот-фиды, Новости и Kalshi">
+        <p className="mb-3 text-xs text-slate-400">
+          Прямые WebSocket-котировки с криптобирж (Binance, Bybit) для снайпинга 5m/15m рынков и токены новостных API.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="flex items-center justify-between rounded-xl border border-slate-800/80 bg-slate-900/40 p-3">
+            <div>
+              <div className="text-sm font-medium text-slate-200">Binance WebSocket</div>
+              <div className="text-[11px] text-slate-400">Прямой поток спота BTC/ETH/SOL</div>
+            </div>
+            <Toggle checked={s.binanceFeedEnabled} onChange={(v) => set("binanceFeedEnabled", v)} />
+          </div>
+          <div className="flex items-center justify-between rounded-xl border border-slate-800/80 bg-slate-900/40 p-3">
+            <div>
+              <div className="text-sm font-medium text-slate-200">Bybit WebSocket</div>
+              <div className="text-[11px] text-slate-400">Резервный поток и контроль спреда</div>
+            </div>
+            <Toggle checked={s.bybitFeedEnabled} onChange={(v) => set("bybitFeedEnabled", v)} />
+          </div>
+          {numField("kellyFraction", "Доля Келли (Kelly Fraction)", "0.25 = 1/4 Келли")}
+        </div>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Field label="CryptoPanic Token" hint="для стратегии news_lag (бесплатно на cryptopanic.com/developers/api/)">
+            <input className={inputCls} value={s.cryptoPanicToken} onChange={str("cryptoPanicToken")} placeholder="auth_token" />
+          </Field>
+          <Field label="NewsAPI Key" hint="для стратегии news_lag (бесплатно на newsapi.org)">
+            <input className={inputCls} value={s.newsApiKey} onChange={str("newsApiKey")} placeholder="api_key" />
+          </Field>
+          <Field label="Kalshi API Key ID" hint="для кросс-платформенного арбитража">
+            <input className={inputCls} value={s.kalshiApiKeyId} onChange={str("kalshiApiKeyId")} placeholder="key_id" />
+          </Field>
+          <Field label="Kalshi Private Key (Path/Secret)" hint="RSA ключ Kalshi">
+            <input className={inputCls} value={s.kalshiPrivateKey} onChange={str("kalshiPrivateKey")} placeholder="private_key" />
+          </Field>
         </div>
       </Card>
 

@@ -14,6 +14,12 @@ function mask(s: Awaited<ReturnType<typeof getSettings>>) {
     telegramBotTokenSet: Boolean(s.telegramBotToken),
     httpProxyUrl: s.httpProxyUrl.replace(/\/\/([^:@]+):([^@]+)@/, "//$1:••••@"),
     httpProxyUrlSet: Boolean(s.httpProxyUrl),
+    cryptoPanicToken: s.cryptoPanicToken ? `${s.cryptoPanicToken.slice(0, 4)}…${s.cryptoPanicToken.slice(-4)}` : "",
+    cryptoPanicTokenSet: Boolean(s.cryptoPanicToken),
+    newsApiKey: s.newsApiKey ? `${s.newsApiKey.slice(0, 4)}…${s.newsApiKey.slice(-4)}` : "",
+    newsApiKeySet: Boolean(s.newsApiKey),
+    kalshiPrivateKey: s.kalshiPrivateKey ? "••••••" : "",
+    kalshiPrivateKeySet: Boolean(s.kalshiPrivateKey),
   };
 }
 
@@ -26,7 +32,14 @@ export async function GET() {
   });
 }
 
-const SECRET_KEYS = ["aiApiKey", "telegramBotToken", "httpProxyUrl"] as const;
+const SECRET_KEYS = [
+  "aiApiKey",
+  "telegramBotToken",
+  "httpProxyUrl",
+  "cryptoPanicToken",
+  "newsApiKey",
+  "kalshiPrivateKey",
+] as const;
 
 export async function PUT(req: Request) {
   const body = (await req.json()) as Record<string, unknown>;
@@ -43,6 +56,9 @@ export async function PUT(req: Request) {
   delete patch.aiApiKeySet;
   delete patch.telegramBotTokenSet;
   delete patch.httpProxyUrlSet;
+  delete patch.cryptoPanicTokenSet;
+  delete patch.newsApiKeySet;
+  delete patch.kalshiPrivateKeySet;
   delete patch.updatedAt;
   const s = await updateSettings(patch);
   return Response.json({ settings: mask(s), liveReadiness: liveReadiness(s) });

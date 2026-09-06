@@ -20,6 +20,8 @@ import {
   saveStrategyConfig, selectStrategyConfigs, sourceStats, updateSettings, updateWhale, whaleStats,
 } from "./store";
 import { runSingleStrategy, STRATEGIES } from "./strategies";
+import { getSpotAggregator } from "./spot-feeds";
+import { getRecentNews } from "./news";
 import type { TradingMode } from "./types";
 
 export type ToolDef = { type: "function"; function: { name: string; description: string; parameters: Record<string, unknown> } };
@@ -168,6 +170,42 @@ tool("live_readiness", "Проверить готовность LIVE: env-пер
   const { liveReadiness } = await import("./executor");
   const { executor } = createExecutor(s, () => {});
   return { ...liveReadiness(s), balanceUsd: s.tradingMode === "live" ? await executor.balanceUsd() : null, wsUrl: realtime.wsUrl };
+});
+
+tool("get_spot_prices", "Живые котировки BTC, ETH, SOL в реальном времени с Binance и Bybit, со спредом (дивергенцией).", { asset: { type: "string", enum: ["BTC", "ETH", "SOL"] } }, async (a) => {
+  const asset = str(a.asset, "BTC").toUpperCase();
+  const agg = getSpotAggregator(asset);
+  const snap = await agg.getSnapshotOrWait(1500);
+  return {
+    asset,
+    ok: snap.ok,
+    price: snap.price,
+    primaryVenue: snap.primaryVenue,
+    divergenceBps: (snap.divergenceBps ?? 0).toFixed(1) + " bps",
+    isDivergenceHigh: Boolean(snap.isDivergenceHigh),
+    formatted: `$${(snap.price ?? 0).toFixed(2)} (${snap.primaryVenue ?? "none"})`,
+  };
+});
+
+tool("get_crypto_news", "Последние горячие новости криптовалют из CryptoPanic/NewsAPI с оценкой влияния на рынок (materiality 1-100).", { lookbackSeconds: { type: "number" } }, async (a) => {
+  const list = await getRecentNews(num(a.lookbackSeconds, 3600));
+  return list.slice(0, 10).map((n) => ({
+    title: n.title,
+    source: n.source,
+    direction: n.direction,
+    materiality: n.materiality,
+    publishedAt: n.publishedAt,
+    url: n.url,
+  }));
+});
+
+tool("get_kalshi_status", "Проверяет статус интеграции и готовность API биржи Kalshi.", {}, async () => {
+  const s = await getSettings();
+  return {
+    ready: Boolean(s.kalshiApiKeyId && s.kalshiPrivateKey),
+    hasApiKeyId: Boolean(s.kalshiApiKeyId),
+    hasPrivateKey: Boolean(s.kalshiPrivateKey),
+  };
 });
 
 export const TOOLS: ToolDef[] = registry.map((r) => r.def);

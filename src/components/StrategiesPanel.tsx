@@ -23,8 +23,11 @@ type RunResp = { ok: boolean; result: { opened: number; scanned: number; skipped
 
 const RISK: Record<string, { label: string; tone: "green" | "amber" | "red" | "slate" }> = {
   arb_yes_no: { label: "низкий риск", tone: "green" },
+  cross_venue_arb: { label: "минимальный (арбитраж)", tone: "green" },
   favorite_finish: { label: "низкий риск", tone: "green" },
+  spot_strike_sniper: { label: "низкий риск (спот)", tone: "green" },
   crypto_threshold: { label: "низкий–средний", tone: "green" },
+  news_lag: { label: "средний (новости)", tone: "amber" },
   copy: { label: "зависит от кита", tone: "amber" },
   consensus: { label: "средний", tone: "amber" },
   momentum: { label: "средний", tone: "amber" },

@@ -63,6 +63,15 @@ export const settings = pgTable("settings", {
   walletMinVolumeUsd: doublePrecision("wallet_min_volume_usd").notNull().default(5000),
   walletMaxDrawdownPct: doublePrecision("wallet_max_drawdown_pct").notNull().default(0.3),
 
+  // внешние фиды и новости
+  binanceFeedEnabled: boolean("binance_feed_enabled").notNull().default(true),
+  bybitFeedEnabled: boolean("bybit_feed_enabled").notNull().default(true),
+  cryptoPanicToken: text("crypto_panic_token").notNull().default(""),
+  newsApiKey: text("news_api_key").notNull().default(""),
+  kalshiApiKeyId: text("kalshi_api_key_id").notNull().default(""),
+  kalshiPrivateKey: text("kalshi_private_key").notNull().default(""),
+  kellyFraction: doublePrecision("kelly_fraction").notNull().default(0.25),
+
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -250,6 +259,53 @@ export const strategyConfigs = pgTable("strategy_configs", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** События новостей (CryptoPanic / NewsAPI) */
+export const newsEvents = pgTable(
+  "news_events",
+  {
+    id: serial("id").primaryKey(),
+    source: text("source").notNull(),
+    sourceEventId: text("source_event_id"),
+    title: text("title").notNull(),
+    url: text("url"),
+    symbols: jsonb("symbols").$type<string[]>().notNull().default([]),
+    publishedAt: timestamp("published_at", { withTimezone: true }).notNull().defaultNow(),
+    direction: text("direction").notNull().default("neutral"),
+    materiality: integer("materiality").notNull().default(0),
+    summary: text("summary"),
+    rawPayload: jsonb("raw_payload").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("news_events_published_at_idx").on(t.publishedAt),
+    index("news_events_source_idx").on(t.source),
+  ]
+);
+
+/** Связка рынков Polymarket и Kalshi для арбитража */
+export const marketMapping = pgTable(
+  "market_mapping",
+  {
+    id: serial("id").primaryKey(),
+    eventKey: text("event_key").notNull().unique(),
+    baseAsset: text("base_asset").notNull(),
+    timeframe: text("timeframe").notNull(),
+    polymarketMarketId: text("polymarket_market_id"),
+    kalshiMarketId: text("kalshi_market_id"),
+    strike: doublePrecision("strike"),
+    settlementSource: text("settlement_source"),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("market_mapping_event_key_unique").on(t.eventKey),
+    index("market_mapping_base_asset_idx").on(t.baseAsset),
+  ]
+);
+
+export type NewsEventRow = typeof newsEvents.$inferSelect;
+export type MarketMappingRow = typeof marketMapping.$inferSelect;
 export type Settings = typeof settings.$inferSelect;
 export type Whale = typeof whales.$inferSelect;
 export type PortfolioRow = typeof portfolios.$inferSelect;
