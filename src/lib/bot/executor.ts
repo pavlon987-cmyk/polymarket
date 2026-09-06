@@ -108,6 +108,43 @@ export class PaperExecutor implements Executor {
   }
 }
 
+export async function getOnChainCollateralBalance(address: string): Promise<number> {
+  const rpcs = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.llamarpc.com",
+    "https://1rpc.io/matic",
+  ];
+  // Polygon tokens: pUSD (Polymarket USD), USDC.e (bridged), USDC (native)
+  const tokens = [
+    "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", // pUSD
+    "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e
+    "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", // Native USDC
+  ];
+  const cleanAddr = address.toLowerCase().replace("0x", "").padStart(64, "0");
+  const data = "0x70a08231" + cleanAddr;
+
+  for (const rpc of rpcs) {
+    try {
+      let total = 0;
+      for (const token of tokens) {
+        const res = await fetch(rpc, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: token, data }, "latest"] }),
+          signal: AbortSignal.timeout(3000),
+        }).then((r) => r.json());
+        if (res?.result && res.result !== "0x") {
+          total += Number(BigInt(res.result)) / 1e6;
+        }
+      }
+      return total;
+    } catch {
+      // try next RPC
+    }
+  }
+  return 0;
+}
+
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export class LiveExecutor implements Executor {
   readonly mode: TradingMode = "live";
@@ -152,9 +189,31 @@ export class LiveExecutor implements Executor {
       const res = await client.getBalanceAllowance({ asset_type: this.mod.AssetType.COLLATERAL });
 
       // ФИКС: нормализуем (может быть string/base units)
-      const bal = parseClobAmount(res?.balance ?? 0);
+      let bal = parseClobAmount(res?.balance ?? 0);
+
+      // Если CLOB API вернул 0 (средства в pUSD или кэш ещё не обновился),
+      // проверяем прямой on-chain баланс на Polygon (pUSD / USDC.e / USDC) для funder адреса:
+      if (!bal || bal <= 0) {
+        const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
+        if (funder) {
+          const onChainBal = await getOnChainCollateralBalance(funder);
+          if (onChainBal > 0) {
+            bal = onChainBal;
+          }
+        }
+      }
+
       return Number.isFinite(bal) ? bal : null;
     } catch (err) {
+      const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
+      if (funder) {
+        try {
+          const onChainBal = await getOnChainCollateralBalance(funder);
+          if (onChainBal > 0) return onChainBal;
+        } catch {
+          // ignore
+        }
+      }
       this.log(`⚠️ Баланс USDC недоступен: ${(err as Error).message}`);
       return null;
     }

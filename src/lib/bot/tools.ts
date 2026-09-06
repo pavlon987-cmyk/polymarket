@@ -167,9 +167,10 @@ tool("cash_adjustment", "Пополнение/вывод виртуальног�
 
 tool("live_readiness", "Проверить готовность LIVE: env-переменные, тумблер, баланс USDC, WS.", {}, async () => {
   const s = await getSettings();
-  const { liveReadiness } = await import("./executor");
-  const { executor } = createExecutor(s, () => {});
-  return { ...liveReadiness(s), balanceUsd: s.tradingMode === "live" ? await executor.balanceUsd() : null, wsUrl: realtime.wsUrl };
+  const { liveReadiness, LiveExecutor } = await import("./executor");
+  const liveExec = new LiveExecutor(s, () => {});
+  const bal = await liveExec.balanceUsd();
+  return { ...liveReadiness(s), balanceUsd: bal, wsUrl: realtime.wsUrl };
 });
 
 tool("get_spot_prices", "Живые котировки BTC, ETH, SOL в реальном времени с Binance и Bybit, со спредом (дивергенцией).", { asset: { type: "string", enum: ["BTC", "ETH", "SOL"] } }, async (a) => {
