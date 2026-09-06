@@ -120,7 +120,9 @@ async function runCycleLocked(trigger: string, startedAt: string): Promise<Cycle
     // Live: реальный баланс USDC — источник правды вместо paper-леджера
     if (mode === "live") {
       const bal = await executor.balanceUsd();
-      if (bal !== null && Math.abs(bal - ledger.cashUsd) > 0.5) {
+      // Защита: обновляем кэш только если баланс успешно получен (не null)
+      // и не сбрасываем кэш в 0 без открытых сделок (защита от ложного сброса при сбое RPC)
+      if (bal !== null && (bal > 0 || ctx.open.length > 0) && Math.abs(bal - ledger.cashUsd) > 0.5) {
         await log("warn", `💳 LIVE: баланс USDC $${bal.toFixed(2)} ≠ леджер $${ledger.cashUsd.toFixed(2)} — вношу корректировку`);
         await addCashAdjustment("live", bal - ledger.cashUsd, "sync with on-chain USDC balance");
         ledger = await reconcilePortfolio(mode, { log: false });
@@ -140,7 +142,12 @@ async function runCycleLocked(trigger: string, startedAt: string): Promise<Cycle
 
     // ── Аварийный стоп-лосс по ЭКВИТИ (а не по кэшу) ──
     const maxDrawdown = ledger.startingBankUsd * settings.stopLossPercent;
-    if (ledger.equityUsd <= ledger.startingBankUsd - maxDrawdown && !portfolio.halted) {
+    // Автоматическое снятие ложной блокировки: если открытых позиций нет и эквити в норме (нет убытка)
+    if (ledger.openCount === 0 && ledger.equityUsd >= ledger.startingBankUsd * 0.95 && portfolio.halted) {
+      portfolio.halted = false;
+      await savePortfolioMeta(portfolio);
+      await log("info", `🟢 Стоп-лосс портфеля снят: открытых позиций нет, эквити ($${ledger.equityUsd.toFixed(2)}) в норме.`);
+    } else if (ledger.equityUsd <= ledger.startingBankUsd - maxDrawdown && !portfolio.halted) {
       portfolio.halted = true;
       await savePortfolioMeta(portfolio);
       await log("error", `🚨 АВАРИЙНАЯ ОСТАНОВКА: просадка эквити превысила ${Math.round(settings.stopLossPercent * 100)}% банка!`);

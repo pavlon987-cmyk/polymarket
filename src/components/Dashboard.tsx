@@ -231,6 +231,18 @@ export function Dashboard() {
       await load();
     }
   };
+  const resume = async () => {
+    if (!s) return;
+    setBusy("resume");
+    try {
+      await api("/api/bot/resume", { method: "POST", body: JSON.stringify({ mode: s.mode }) });
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(null);
+      await load();
+    }
+  };
 
   if (!s) {
     return (
@@ -307,12 +319,16 @@ export function Dashboard() {
         </Alert>
       )}
       {p.halted && (
-        <Alert tone="red" title="🚨 Сработал стоп-лосс портфеля">
-          Бот больше не открывает позиции (открытые продолжают отслеживаться). Снять блокировку: сбросить портфель или увеличить «Стоп-лосс портфеля» в{" "}
-          <Link href="/settings" className="underline">
-            настройках
-          </Link>
-          .
+        <Alert
+          tone="red"
+          title="🚨 Сработал стоп-лосс портфеля"
+          right={
+            <Btn size="sm" variant="primary" onClick={resume} disabled={busy === "resume"}>
+              {busy === "resume" ? "Снимаю..." : "Снять блокировку (Возобновить)"}
+            </Btn>
+          }
+        >
+          Бот временно не открывает новые позиции. Если реальных убытков нет (ложное срабатывание при проверке баланса), нажми «Снять блокировку», чтобы продолжить торговлю.
         </Alert>
       )}
       {s.configuredMode === "live" && !s.liveReadiness.ready && (

@@ -108,9 +108,10 @@ export class PaperExecutor implements Executor {
   }
 }
 
-export async function getOnChainCollateralBalance(address: string): Promise<number> {
+export async function getOnChainCollateralBalance(address: string): Promise<number | null> {
   const rpcs = [
     "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.gateway.tenderly.co",
     "https://polygon.llamarpc.com",
     "https://1rpc.io/matic",
   ];
@@ -126,23 +127,27 @@ export async function getOnChainCollateralBalance(address: string): Promise<numb
   for (const rpc of rpcs) {
     try {
       let total = 0;
+      let successTokens = 0;
       for (const token of tokens) {
         const res = await fetch(rpc, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: token, data }, "latest"] }),
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(5000),
         }).then((r) => r.json());
         if (res?.result && res.result !== "0x") {
           total += Number(BigInt(res.result)) / 1e6;
+          successTokens++;
         }
       }
-      return total;
+      if (successTokens > 0) {
+        return total;
+      }
     } catch {
       // try next RPC
     }
   }
-  return 0;
+  return null;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -197,8 +202,11 @@ export class LiveExecutor implements Executor {
         const funder = process.env.POLYMARKET_FUNDER_ADDRESS;
         if (funder) {
           const onChainBal = await getOnChainCollateralBalance(funder);
-          if (onChainBal > 0) {
+          if (onChainBal !== null) {
             bal = onChainBal;
+          } else {
+            // RPC недоступны — возвращаем null, чтобы не обнулять кэш и не триггерить ложный стоп-лосс
+            return null;
           }
         }
       }
@@ -209,7 +217,7 @@ export class LiveExecutor implements Executor {
       if (funder) {
         try {
           const onChainBal = await getOnChainCollateralBalance(funder);
-          if (onChainBal > 0) return onChainBal;
+          if (onChainBal !== null) return onChainBal;
         } catch {
           // ignore
         }

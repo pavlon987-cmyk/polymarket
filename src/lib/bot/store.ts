@@ -152,6 +152,12 @@ export async function savePortfolio(p: PortfolioRow): Promise<void> {
   await savePortfolioMeta(p);
 }
 
+export async function unhaltPortfolio(mode: TradingMode): Promise<PortfolioRow> {
+  await db.update(portfolios).set({ halted: false, lastUpdated: new Date() }).where(eq(portfolios.mode, mode));
+  await addLog("info", `🟢 Блокировка (стоп-лосс) портфеля ${mode} снята`);
+  return (await db.select().from(portfolios).where(eq(portfolios.mode, mode)).limit(1))[0];
+}
+
 export async function resetPortfolio(mode: TradingMode): Promise<void> {
   await db.delete(positions).where(eq(positions.mode, mode));
   await db.delete(aiDecisions).where(eq(aiDecisions.mode, mode));
