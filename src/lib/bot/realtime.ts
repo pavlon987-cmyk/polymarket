@@ -194,7 +194,7 @@ class Realtime extends EventEmitter {
         const ev = JSON.parse(String(raw)) as Record<string, unknown>;
         if (ev.event_type === "trade") {
           await db.execute(sql`insert into live_fills (order_id, trade_id, token_id, side, price, size, status, raw)
-            values (${String(ev.taker_order_id ?? "")}, ${String(ev.id ?? "")}, ${String(ev.asset_id ?? "")}, ${String(ev.side ?? "")}, ${Number(ev.price ?? 0)}, ${Number(ev.size ?? 0)}, ${String(ev.status ?? "")}, ${JSON.stringify(ev)}::jsonb)
+            values (${String(ev.taker_order_id ?? ev.maker_order_id ?? "")}, ${String(ev.id ?? "")}, ${String(ev.asset_id ?? "")}, ${String(ev.side ?? "")}, ${Number(ev.price ?? 0)}, ${Number(ev.size ?? 0)}, ${String(ev.status ?? "")}, ${JSON.stringify(ev)}::jsonb)
             on conflict (trade_id) do update set status = excluded.status, raw = excluded.raw`);
         }
         this.publish("fill", ev);

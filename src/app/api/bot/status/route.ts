@@ -1,5 +1,6 @@
 import { liveReadiness } from "@/lib/bot/executor";
 import { getRunnerState } from "@/lib/bot/runner";
+import { cycleLockInfo } from "@/lib/bot/lock";
 import {
   closedPositions,
   getPortfolio,
@@ -35,6 +36,7 @@ export async function GET(req: Request) {
     const inPositions = positionsValue(open);
     const equity = portfolio.cashUsd + inPositions;
     const readiness = liveReadiness(settings);
+    const cycleLock = await cycleLockInfo();
 
     return Response.json({
       mode,
@@ -42,6 +44,7 @@ export async function GET(req: Request) {
       liveReadiness: readiness,
       aiEnabled: settings.aiEnabled,
       runner: getRunnerState(),
+      cycleLock,
       portfolio: { ...portfolio, inPositions, equity },
       open,
       closed,
