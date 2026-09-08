@@ -881,6 +881,154 @@ export const STRATEGIES: StrategyDef[] = [
       return r;
     },
   },
+  {
+    id: "safe_compound_favorite",
+    name: "Безопасный разгон банка (Память Васи)",
+    emoji: "📈",
+    needsAi: false,
+    description: "Эмпирическая стратегия быстрого роста без лишнего риска (100% винрейт в истории бота, +$1.29 чистыми): ловит предопределённые исходы (цена 85–93¢ за 0.2–4ч до конца с TP 99¢) и консенсус 2+ китов на валуе (15–48¢ с TP +50%).",
+    defaults: {
+      maxBetUsd: 1.5,
+      maxPositions: 3,
+      params: {
+        minFavPrice: 0.85,
+        maxFavPrice: 0.93,
+        maxHoursToEnd: 4.0,
+        minHoursToEnd: 0.2,
+        minVolumeUsd: 1000,
+        takeProfitPrice: 0.985,
+        enableConsensus: 1,
+        consensusMinWhales: 2,
+        consensusMaxPrice: 0.48,
+      },
+    },
+    paramLabels: {
+      minFavPrice: "Мин. цена фаворита",
+      maxFavPrice: "Макс. цена фаворита",
+      maxHoursToEnd: "Макс. часов до конца",
+      minHoursToEnd: "Мин. часов до конца",
+      minVolumeUsd: "Мин. объём ($)",
+      takeProfitPrice: "Тейк-профит (цена)",
+      enableConsensus: "Искать консенсус китов (1/0)",
+      consensusMinWhales: "Мин. китов для консенсуса",
+      consensusMaxPrice: "Макс. цена консенсуса",
+    },
+    async run(ctx) {
+      const r = res();
+      const h = held(ctx);
+      const minFav = ctx.p("minFavPrice", 0.85);
+      const maxFav = ctx.p("maxFavPrice", 0.93);
+      const maxH = ctx.p("maxHoursToEnd", 4.0);
+      const minH = ctx.p("minHoursToEnd", 0.2);
+      const minVol = ctx.p("minVolumeUsd", 1000);
+
+      // ── Блок 1: Верняковый фаворит на финише (85–93¢ за ≤4ч до конца) ──
+      const allMarkets = await ctx.markets();
+      const favCandidates = allMarkets.filter((m) => {
+        if (h.has(m.conditionId) || m.closed || !m.acceptingOrders) return false;
+        if (m.volumeUsd < minVol) return false;
+        const hte = hoursToEnd(m);
+        if (hte === null || hte > maxH || hte < minH) return false;
+        return m.outcomePrices.some((p) => p >= minFav && p <= maxFav);
+      });
+
+      r.scanned += favCandidates.length;
+
+      for (const m of favCandidates) {
+        if (await canOpen(ctx, m.conditionId)) break;
+        const idx = m.outcomePrices.findIndex((p) => p >= minFav && p <= maxFav);
+        if (idx < 0) continue;
+
+        const live = (await ctx.api.fetchMidPrice(m.clobTokenIds[idx])) ?? m.outcomePrices[idx];
+        if (live < minFav || live > maxFav + 0.02) continue;
+
+        const hte = hoursToEnd(m) ?? 0;
+        const bet = Math.min(ctx.cfg.maxBetUsd, ctx.portfolio.cashUsd);
+        if (bet < 0.5) continue;
+
+        const row = await openPosition(ctx, {
+          market: m,
+          outcomeIndex: idx,
+          price: live,
+          usd: bet,
+          confidence: 0.95,
+          reason: `📈 Разгон: фаворит ${cents(live)} за ${hte.toFixed(1)}ч до конца [цель 99¢, ROI ~${Math.round(((1 - live) / live) * 100)}%]`,
+        });
+
+        if (row) {
+          r.opened++;
+          h.add(m.conditionId);
+          r.notes.push(`🏆 Фаворит: ${short(m.question, 35)} [${m.outcomes[idx]}] @ ${cents(live)}`);
+        }
+      }
+
+      // ── Блок 2: Консенсус 2+ китов на валуйных исходах (15–48¢) ──
+      if (ctx.p("enableConsensus", 1) && !(await canOpen(ctx))) {
+        const minW = Math.max(2, ctx.p("consensusMinWhales", 2));
+        const maxConP = ctx.p("consensusMaxPrice", 0.48);
+        const windowSec = 12 * 3600;
+        const now = Date.now() / 1000;
+
+        type Agg = { byWhale: Map<string, Map<string, number>>; title: string };
+        const agg = new Map<string, Agg>();
+
+        for (const [addr, trades] of ctx.whaleTrades) {
+          for (const t of trades) {
+            if (now - t.timestamp > windowSec) continue;
+            const a = agg.get(t.conditionId) ?? { byWhale: new Map(), title: t.title };
+            const w = a.byWhale.get(addr) ?? new Map<string, number>();
+            w.set(t.asset, (w.get(t.asset) ?? 0) + (t.side === "BUY" ? 1 : -1) * t.size * t.price);
+            a.byWhale.set(addr, w);
+            agg.set(t.conditionId, a);
+          }
+        }
+
+        for (const [cid, a] of agg) {
+          if (h.has(cid) || (await canOpen(ctx))) continue;
+          const votes = new Map<string, number>();
+          for (const [, byAsset] of a.byWhale) {
+            const longs = [...byAsset.entries()].filter(([, usd]) => usd >= 5);
+            if (longs.length === 1) {
+              votes.set(longs[0][0], (votes.get(longs[0][0]) ?? 0) + 1);
+            }
+          }
+
+          for (const [asset, n] of votes) {
+            if (n < minW) continue;
+            const m = await ctx.api.fetchMarket(cid);
+            if (!m || m.closed || !m.acceptingOrders) continue;
+            const hte = hoursToEnd(m);
+            if (hte !== null && (hte < 2 || hte > 48)) continue; // отсекаем 15-минутный шум и слишком долгие рынки
+
+            const idx = m.clobTokenIds.indexOf(asset);
+            if (idx < 0) continue;
+            const live = (await ctx.api.fetchMidPrice(asset)) ?? m.outcomePrices[idx];
+            if (live < 0.15 || live > maxConP) continue;
+
+            const bet = Math.min(ctx.cfg.maxBetUsd, ctx.portfolio.cashUsd);
+            if (bet < 0.5) continue;
+
+            const row = await openPosition(ctx, {
+              market: m,
+              outcomeIndex: idx,
+              price: live,
+              usd: bet,
+              confidence: 0.88,
+              reason: `📈 Разгон: консенсус ${n} китов по ${cents(live)} за 12ч (цель +50%)`,
+            });
+
+            if (row) {
+              r.opened++;
+              h.add(cid);
+              r.notes.push(`🤝 Консенсус (${n} кита): ${short(m.question, 35)} @ ${cents(live)}`);
+            }
+          }
+        }
+      }
+
+      return r;
+    },
+  },
 ];
 
 // ── Конфиги (с посевом дефолтов) ────────────────────────────────────────────

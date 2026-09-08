@@ -550,8 +550,8 @@ export function Dashboard() {
               </div>
               {cycle.error && <p className="text-rose-300">{cycle.error}</p>}
               <details className="group">
-                <summary className="cursor-pointer text-xs text-indigo-400 hover:underline">показать журнал цикла ({cycle.notes.length} строк)</summary>
-                <pre className="mt-2 max-h-80 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">{cycle.notes.join("\n")}</pre>
+                <summary className="cursor-pointer text-xs text-indigo-400 hover:underline">показать журнал цикла ({cycle.notes?.length ?? 0} строк)</summary>
+                <pre className="mt-2 max-h-80 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">{(cycle.notes ?? []).join("\n")}</pre>
               </details>
               <Link href="/logs" className="inline-block text-xs text-indigo-400 hover:underline">
                 Полный журнал →

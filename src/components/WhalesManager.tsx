@@ -102,8 +102,8 @@ export function WhalesManager() {
     setDiscovering(true);
     try {
       const r = await api<{ candidates: Candidate[]; messages: string[] }>("/api/whales/discover?limit=500");
-      setCands(r.candidates);
-      if (r.messages.length && !r.candidates.length) setErr(r.messages.join("; "));
+      setCands(r.candidates ?? []);
+      if (r.messages?.length && !r.candidates?.length) setErr(Array.isArray(r.messages) ? r.messages.join("; ") : String(r.messages));
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -144,8 +144,9 @@ export function WhalesManager() {
   const scoreBadge = (sc: Score | "loading" | undefined) => {
     if (!sc) return null;
     if (sc === "loading") return <Badge tone="slate">проверяю…</Badge>;
+    const notesStr = Array.isArray(sc.notes) ? sc.notes.join("\n") : (sc.notes ? String(sc.notes) : "");
     return (
-      <Badge tone={sc.verified ? "green" : sc.score >= 40 ? "amber" : "red"} title={sc.notes.join("\n")}>
+      <Badge tone={sc.verified ? "green" : sc.score >= 40 ? "amber" : "red"} title={notesStr}>
         {sc.verified ? "✅" : "❌"} score {sc.score} · {sc.category}
       </Badge>
     );
@@ -265,7 +266,7 @@ export function WhalesManager() {
                     {chk.count === 0 ? (
                       <div className="text-amber-300">
                         ❌ Сделок не найдено. Проверь адрес (нужен proxy-кошелёк) или доступ к API.
-                        {chk.messages.length > 0 && <pre className="mt-1 whitespace-pre-wrap text-slate-500">{chk.messages.join("\n")}</pre>}
+                        {Array.isArray(chk.messages) && chk.messages.length > 0 && <pre className="mt-1 whitespace-pre-wrap text-slate-500">{chk.messages.join("\n")}</pre>}
                       </div>
                     ) : (
                       <>
@@ -385,7 +386,9 @@ export function WhalesManager() {
                   usd(c.volumeUsd),
                   `${Math.round(c.buyRatio * 100)}%`,
                   cents(c.avgPrice),
-                  <span key="m" className="block max-w-[260px] truncate text-xs text-slate-400" title={c.markets.join("\n")}>{c.markets.join(" · ")}</span>,
+                  <span key="m" className="block max-w-[260px] truncate text-xs text-slate-400" title={(c.markets ?? []).join("\n")}>
+                    {(c.markets ?? []).join(" · ")}
+                  </span>,
                   <span key="s">
                     {scores[c.address.toLowerCase()] ? scoreBadge(scores[c.address.toLowerCase()]) : <Btn size="sm" variant="ghost" onClick={() => verify(c.address)}>🔍</Btn>}
                   </span>,

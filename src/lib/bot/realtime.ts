@@ -116,8 +116,10 @@ class Realtime extends EventEmitter {
       const ev = m as Record<string, unknown>;
       const tokenId = String(ev.asset_id ?? "");
       if (ev.event_type === "book" && Array.isArray(ev.bids) && Array.isArray(ev.asks)) {
-        const bestBid = Math.max(0, ...(ev.bids as { price: string }[]).map((b) => Number(b.price)));
-        const bestAsk = Math.min(1, ...(ev.asks as { price: string }[]).map((a) => Number(a.price)));
+        const bidPrices = (ev.bids as { price: string }[]).map((b) => Number(b.price)).filter((p) => Number.isFinite(p) && p > 0);
+        const askPrices = (ev.asks as { price: string }[]).map((a) => Number(a.price)).filter((p) => Number.isFinite(p) && p > 0);
+        const bestBid = bidPrices.length ? Math.max(...bidPrices) : 0;
+        const bestAsk = askPrices.length ? Math.min(...askPrices) : 1;
         if (bestBid > 0 && bestAsk < 1) {
           const mid = (bestBid + bestAsk) / 2;
           this.lastPrices.set(tokenId, mid);

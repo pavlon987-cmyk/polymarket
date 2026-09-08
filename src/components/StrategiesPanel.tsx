@@ -174,7 +174,7 @@ export function StrategiesPanel() {
         <Card title="📋 Результат прогона всех включённых стратегий">
           {runLog.summary && <div className="mb-2 text-xs font-medium text-emerald-400">{runLog.summary}</div>}
           <pre className="max-h-80 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">
-            {runLog.lines.join("\n") || "пусто"}
+            {(runLog.lines ?? []).join("\n") || "пусто"}
           </pre>
         </Card>
       )}
@@ -275,7 +275,7 @@ export function StrategiesPanel() {
               {runLog?.id === s.id && (
                 <div className="mt-3">
                   {runLog.summary && <div className="mb-1 text-xs text-slate-400">{runLog.summary}</div>}
-                  <pre className="max-h-64 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">{runLog.lines.join("\n") || "пусто"}</pre>
+                  <pre className="max-h-64 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300">{(runLog.lines ?? []).join("\n") || "пусто"}</pre>
                 </div>
               )}
             </Card>

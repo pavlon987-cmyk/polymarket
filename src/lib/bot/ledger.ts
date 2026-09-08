@@ -116,6 +116,16 @@ export async function computeLedger(mode: TradingMode, p?: PortfolioRow): Promis
  */
 export async function reconcilePortfolio(mode: TradingMode, opts: { log?: boolean } = {}): Promise<LedgerSummary> {
   const led = await computeLedger(mode);
+
+  // Всегда обновляем общий оборот (не влияет на reserveCash/creditCash)
+  await db
+    .update(portfolios)
+    .set({
+      totalInvestedUsd: led.costAllUsd,
+      lastUpdated: new Date(),
+    })
+    .where(eq(portfolios.mode, mode));
+
   const drift = Math.abs(led.cashDriftUsd);
   if (drift > 0.009 || led.identityErrorUsd > 0.009) {
     await db
@@ -123,7 +133,6 @@ export async function reconcilePortfolio(mode: TradingMode, opts: { log?: boolea
       .set({
         cashUsd: led.cashUsd,
         realizedPnlUsd: led.realizedPnlUsd,
-        totalInvestedUsd: led.costAllUsd,
         lastUpdated: new Date(),
       })
       .where(eq(portfolios.mode, mode));

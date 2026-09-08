@@ -106,6 +106,7 @@ export interface ClobV2OrderArgs {
   amount: number; // For BUY: USD; For SELL: shares
   price: number;
   orderType?: "FOK" | "GTC";
+  signatureType?: number;
 }
 
 export interface ClobV2OrderResult {
@@ -158,12 +159,12 @@ export async function executeClobV2Order(args: ClobV2OrderArgs): Promise<ClobV2O
     takerAmtRaw = roundDown(makerAmtRaw * rawPrice, roundCfg.amount); // USD
   }
 
-  const makerAmountStr = Math.round(makerAmtRaw * 1e6).toString();
-  const takerAmountStr = Math.round(takerAmtRaw * 1e6).toString();
+  const makerAmountStr = ethers.utils.parseUnits(makerAmtRaw.toFixed(6), 6).toString();
+  const takerAmountStr = ethers.utils.parseUnits(takerAmtRaw.toFixed(6), 6).toString();
 
   const salt = Math.floor(Math.random() * 1000000000000);
   const timestamp = Math.floor(Date.now());
-  const signatureType = 3; // Solady POLY_1271
+  const signatureType = args.signatureType ?? Number(process.env.POLYMARKET_SIGNATURE_TYPE ?? 3); // 3 = Solady POLY_1271
 
   const contents_hash = ethers.utils.keccak256(
     ethers.utils.defaultAbiCoder.encode(

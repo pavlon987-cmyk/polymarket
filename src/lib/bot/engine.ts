@@ -142,12 +142,15 @@ async function runCycleLocked(trigger: string, startedAt: string): Promise<Cycle
 
     // ── Аварийный стоп-лосс по ЭКВИТИ (а не по кэшу) ──
     const maxDrawdown = ledger.startingBankUsd * settings.stopLossPercent;
-    // Автоматическое снятие ложной блокировки: если открытых позиций нет и эквити в норме (нет убытка)
-    if (ledger.openCount === 0 && ledger.equityUsd >= ledger.startingBankUsd * 0.95 && portfolio.halted) {
+    const netTradingPnl = ledger.realizedPnlUsd + ledger.unrealizedPnlUsd;
+
+    // Автоматическое снятие блокировки: если эквити выше порога стоп-лосса (или общий PnL в плюсе)
+    if (portfolio.halted && (ledger.equityUsd > ledger.startingBankUsd - maxDrawdown * 0.8 || netTradingPnl >= 0)) {
       portfolio.halted = false;
       await savePortfolioMeta(portfolio);
-      await log("info", `🟢 Стоп-лосс портфеля снят: открытых позиций нет, эквити ($${ledger.equityUsd.toFixed(2)}) в норме.`);
-    } else if (ledger.equityUsd <= ledger.startingBankUsd - maxDrawdown && !portfolio.halted) {
+      await log("info", `🟢 Стоп-лосс портфеля снят: эквити ($${ledger.equityUsd.toFixed(2)}) в норме, чистый PnL: ${usd(netTradingPnl)}.`);
+    } else if (ledger.equityUsd <= ledger.startingBankUsd - maxDrawdown && netTradingPnl < -maxDrawdown && !portfolio.halted) {
+      // Срабатывает ТОЛЬКО если есть реальный торговый убыток, а не временный лаг выплаты
       portfolio.halted = true;
       await savePortfolioMeta(portfolio);
       await log("error", `🚨 АВАРИЙНАЯ ОСТАНОВКА: просадка эквити превысила ${Math.round(settings.stopLossPercent * 100)}% банка!`);
@@ -262,16 +265,7 @@ async function checkAndClosePositions(ctx: Ctx): Promise<{ closed: number; sold:
     }
     if (!pos.marketEndAt && market.endDate) await updatePosition(pos.id, { marketEndAt: new Date(market.endDate) });
 
-    // a/b) Резолв
-    const resolution = resolutionOf(market, pos, now);
-    if (resolution) {
-      const payoutUsd = resolution.status === "WON" ? pos.shares : 0;
-      await finalizePosition(ctx, pos, resolution.status, payoutUsd, payoutUsd - pos.costUsd, resolution.reason);
-      closed++;
-      continue;
-    }
-
-    // Текущая цена: CLOB midpoint → gamma outcomePrice (НЕ оставляем цену входа навсегда)
+    // 1. Текущая цена: CLOB midpoint → gamma outcomePrice
     let mid = await ctx.api.fetchMidPrice(pos.tokenId);
     const gammaPx = market.outcomePrices[pos.outcomeIndex];
     if (mid === null && Number.isFinite(gammaPx)) mid = gammaPx;
@@ -282,7 +276,41 @@ async function checkAndClosePositions(ctx: Ctx): Promise<{ closed: number; sold:
       realtime.publish("price", { positionId: pos.id, tokenId: pos.tokenId, price: mid });
     }
 
-    // c) Истёк давно, а резолва нет → закрываем по последней цене, чтобы не искажать эквити
+    // 2. УМНЫЙ АВТО ТЕЙК-ПРОФИТ (с обязательным учётом цены входа!):
+    // - Если позиция куплена по обычной цене (< 88¢): при росте до ≥ 95¢ (и прибыли ≥ 5%) фиксируем прибыль в кэш.
+    // - Если это фаворит (вход ≥ 88¢, например купили по 93¢): НЕ продаём на 95¢! Продаём досрочно ТОЛЬКО при цене ≥ 98.5¢
+    //   (почти полная выплата 100¢ без ожидания резолва) и СТРОГО в плюс к цене покупки (mid > pos.price).
+    const isLateFavorite = pos.price >= 0.88;
+    const shouldAutoTakeProfit = isLateFavorite
+      ? (mid !== null && mid >= 0.985 && mid > pos.price)
+      : (mid !== null && mid >= 0.95 && mid >= pos.price * 1.05);
+
+    if (shouldAutoTakeProfit && mid !== null) {
+      const pnlPct = (((mid - pos.price) / pos.price) * 100).toFixed(1);
+      if (await sellPosition(ctx, pos, mid, `Take-Profit: цена ${cents(mid)} ≥ ${isLateFavorite ? "98.5¢" : "95¢"} (вход ${cents(pos.price)}, доход +${pnlPct}%)`)) {
+        sold++;
+        continue;
+      }
+    }
+
+    // 3. Резолв (официальное завершение рынка)
+    const resolution = resolutionOf(market, pos, now);
+    if (resolution) {
+      // В LIVE-режиме: при победе сначала пытаемся продать в стакан по лучшей цене, чтобы сразу получить реальные USDC
+      if (ctx.mode === "live" && resolution.status === "WON" && mid !== null && mid >= 0.8) {
+        const soldOk = await sellPosition(ctx, pos, mid, `${resolution.reason} (продажа на бирже)`);
+        if (soldOk) {
+          sold++;
+          continue;
+        }
+      }
+      const payoutUsd = resolution.status === "WON" ? pos.shares : 0;
+      await finalizePosition(ctx, pos, resolution.status, payoutUsd, payoutUsd - pos.costUsd, resolution.reason);
+      closed++;
+      continue;
+    }
+
+    // 4. Истёк давно, а резолва нет → закрываем по последней цене, чтобы не искажать эквити
     const endedMs = market.endDate ? new Date(market.endDate).getTime() : null;
     if (endedMs && now - endedMs > 6 * HOUR && mid !== null) {
       if (await sellPosition(ctx, pos, mid, `Рынок истёк ${Math.round((now - endedMs) / HOUR)}ч назад без резолва — фиксация по последней цене`)) sold++;
@@ -290,18 +318,13 @@ async function checkAndClosePositions(ctx: Ctx): Promise<{ closed: number; sold:
     }
     if (mid === null) continue;
 
-    // Экстремальные цены (де-факто решён)
-    if (mid >= 0.99) {
-      if (await sellPosition(ctx, pos, mid, "Цена ≥ 99¢ (фактически выиграл)")) sold++;
-      continue;
-    }
+    // Экстремально низкие цены (де-факто проиграл)
     if (mid <= 0.01) {
-      // Продаём за копейки, а не списываем в 0 — в live это реальные деньги, в paper — честная оценка
       if (await sellPosition(ctx, pos, mid, "Цена ≤ 1¢ (фактически проиграл)")) sold++;
       continue;
     }
 
-    // Стратегии: свои SL/TP (в %, от цены входа)
+    // 5. Стратегии: свои SL/TP (в %, от цены входа)
     if (pos.source !== "copy") {
       const c = strat.get(pos.source);
       const tp = Number(c?.params.takeProfitPct ?? 0);
@@ -317,7 +340,7 @@ async function checkAndClosePositions(ctx: Ctx): Promise<{ closed: number; sold:
       continue;
     }
 
-    // Копирование: персональные стопы/тейки кита (по абсолютной цене)
+    // 6. Копирование: персональные стопы/тейки кита
     const whale = whales.find((w) => w.id === pos.whaleId);
     const strategy = effectiveStrategy(ctx.settings.defaultStrategy, whale?.strategy);
     if (strategy.takeProfitPrice && mid >= strategy.takeProfitPrice) {
@@ -478,16 +501,39 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
   let sold = 0;
   const stats = await whaleStats(ctx.mode);
 
+  // 1 быстрый запрос на 500 последних сделок всей биржи вместо 92 запросов по каждому киту
+  const recentGlobal = await ctx.api.fetchRecentTrades(500);
+  const globalByWhale = new Map<string, WhaleTrade[]>();
+  for (const t of recentGlobal) {
+    if (!t.proxyWallet) continue;
+    const addr = t.proxyWallet.toLowerCase();
+    const list = globalByWhale.get(addr) ?? [];
+    list.push(t);
+    globalByWhale.set(addr, list);
+  }
+
+  const whalesWithOpen = new Set(ctx.open.map((p) => p.whaleAddress.toLowerCase()));
+  let activeWhalesCount = 0;
+
   for (const whale of whales) {
     const strategy = effectiveStrategy(ctx.settings.defaultStrategy, whale.strategy);
-    await ctx.log("info", `🔎 Кит: ${whale.name} (${whale.category})…`);
+    const addrLower = whale.address.toLowerCase();
+    const hasGlobalTrades = globalByWhale.has(addrLower);
+    const hasOpenPos = whalesWithOpen.has(addrLower);
 
-    const trades = await ctx.api.fetchWhaleTrades(whale.address);
-    ctx.whaleTrades.set(whale.address, trades);
-    if (!trades.length) {
-      await ctx.log("info", `   нет публичных сделок`);
-      continue;
+    let trades: WhaleTrade[] = [];
+    if (hasGlobalTrades) {
+      trades = globalByWhale.get(addrLower) ?? [];
+    } else if (hasOpenPos || recentGlobal.length === 0) {
+      // Всегда проверяем китов, чьи позиции у нас открыты (чтобы не пропустить их SELL), или если глобальная лента пуста
+      trades = await ctx.api.fetchWhaleTrades(whale.address);
     }
+
+    ctx.whaleTrades.set(whale.address, trades);
+    if (!trades.length) continue;
+
+    activeWhalesCount++;
+    await ctx.log("info", `🔎 Кит: ${whale.name} (${whale.category})…`);
 
     const now = Date.now() / 1000;
     const recent = trades.filter((t) => now - t.timestamp <= strategy.maxTradeAgeMin * 60);
@@ -540,27 +586,29 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
     }
 
     const skipped: Record<string, number> = {};
-    const skip = (r: string, t?: WhaleTrade) => {
+    const skip = async (r: string, t?: WhaleTrade) => {
       skipped[r] = (skipped[r] ?? 0) + 1;
-      if (t) void markDone(t);
+      if (t) await markDone(t);
     };
     let copied = 0;
-    const seenThisCycle = new Set<string>(); // одна и та же сделка кита, продублированная в /trades, не копируется дважды
+    const seenThisCycle = new Set<string>(); // дедуп по tradeHash
 
     for (const t of newTrades) {
       if (copied >= strategy.maxCopiesPerCycle) break;
       if (ctx.open.length >= ctx.settings.maxOpenPositions) break;
-      if (t.side !== "BUY") { skip("SELL", t); continue; }
-      if (seenThisCycle.has(t.conditionId)) { skip("дубль сделки кита", t); continue; }
-      if ((sidesByMarket.get(t.conditionId)?.size ?? 0) > 1) { skip("кит купил обе стороны (хедж/ММ)", t); continue; }
-      if (ctx.open.some((p) => p.conditionId === t.conditionId)) { skip("рынок уже в портфеле", t); continue; }
+      if (t.side !== "BUY") { await skip("SELL", t); continue; }
+      const th = tradeHash(t);
+      if (seenThisCycle.has(th)) { await skip("дубль сделки кита", t); continue; }
+      seenThisCycle.add(th);
+      if ((sidesByMarket.get(t.conditionId)?.size ?? 0) > 1) { await skip("кит купил обе стороны (хедж/ММ)", t); continue; }
+      if (ctx.open.some((p) => p.conditionId === t.conditionId)) { await skip("рынок уже в портфеле", t); continue; }
       const price = t.price;
-      if (price > strategy.maxEntryPrice) { skip(`цена > ${cents(strategy.maxEntryPrice)}`, t); continue; }
-      if (price < strategy.minEntryPrice) { skip(`цена < ${cents(strategy.minEntryPrice)}`, t); continue; }
+      if (price > strategy.maxEntryPrice) { await skip(`цена > ${cents(strategy.maxEntryPrice)}`, t); continue; }
+      if (price < strategy.minEntryPrice) { await skip(`цена < ${cents(strategy.minEntryPrice)}`, t); continue; }
       const whaleUsd = t.size * price;
-      if (whaleUsd < strategy.minWhaleTradeUsd) { skip(`сделка кита < ${usd(strategy.minWhaleTradeUsd)}`, t); continue; }
+      if (whaleUsd < strategy.minWhaleTradeUsd) { await skip(`сделка кита < ${usd(strategy.minWhaleTradeUsd)}`, t); continue; }
       const kw = keywordsOk(t.title, strategy);
-      if (kw) { skip(kw, t); continue; }
+      if (kw) { await skip(kw, t); continue; }
 
       await ctx.log("info", `   🎯 Кандидат: ${short(t.title, 40)} [${t.outcome}] ${cents(price)} (кит: ${usd(whaleUsd)})`);
       const market = await ctx.api.fetchMarket(t.conditionId);
@@ -614,7 +662,7 @@ async function scanWhales(ctx: Ctx, whales: Whale[]): Promise<{ opened: number; 
       });
       if (!row) continue;
       await markDone(t);
-      seenThisCycle.add(t.conditionId);
+      seenThisCycle.add(th);
       exposure += row.costUsd;
       copied++;
       opened++;
@@ -657,7 +705,19 @@ async function runHedgeAdvisor(ctx: Ctx) {
         const oppIdx = p.outcomeIndex === 0 ? 1 : 0;
         const oppPrice = (await ctx.api.fetchMidPrice(market.clobTokenIds[oppIdx])) ?? market.outcomePrices[oppIdx];
         const usdHedge = (p.costUsd * Math.min(100, Number(rec.hedgeSizePct))) / 100;
-        await openGuardedHedge(ctx, market, oppIdx, oppPrice, usdHedge, p);
+        await openGuarded(ctx, {
+          market,
+          outcomeIndex: oppIdx,
+          price: oppPrice,
+          usd: usdHedge,
+          source: "hedge",
+          whale: null,
+          category: p.category,
+          label: `🛡️ Хедж #${p.id}`,
+          reason: `ИИ-риск: HEDGE к позиции #${p.id}`,
+          allowMultiLeg: true,
+          aiDecision: { decision: "COPY", confidence: 0.7, sizeMultiplier: 1, reason: `хедж позиции #${p.id}` },
+        });
       }
     }
   } catch (err) {
@@ -666,24 +726,19 @@ async function runHedgeAdvisor(ctx: Ctx) {
 }
 
 async function openGuardedHedge(ctx: Ctx, market: MarketInfo, idx: number, price: number, usdAmt: number, parent: PositionRow) {
-  // Хедж — единственный случай, когда разрешены две позиции на один рынок; помечаем source=hedge
-  const tokenId = market.clobTokenIds[idx];
-  if (await alreadyHeld(ctx.mode, market.conditionId, tokenId)) return;
-  const bet = Math.floor(Math.min(usdAmt, ctx.portfolio.cashUsd) * 100) / 100;
-  if (bet < 1) return;
-  const reserve = await reserveCash(ctx.mode, bet);
-  if (!reserve.ok) return;
-  const fill = await ctx.executor.buy({ tokenId, price, usd: bet, market: market.question });
-  if (!fill.ok) { await creditCash(ctx.mode, bet, 0); return; }
-  const row = await insertPosition({
-    mode: ctx.mode, whaleId: null, whaleName: `🛡️ Хедж #${parent.id}`, whaleAddress: "", source: "hedge", category: parent.category,
-    conditionId: market.conditionId, tokenId, market: market.question, outcome: market.outcomes[idx], outcomeIndex: idx,
-    price: fill.avgPrice, lastPrice: fill.avgPrice, shares: fill.shares, costUsd: fill.costUsd,
-    marketEndAt: market.endDate ? new Date(market.endDate) : null, aiDecision: { decision: "COPY", confidence: 0.7, sizeMultiplier: 1, reason: `хедж позиции #${parent.id}` },
+  return openGuarded(ctx, {
+    market,
+    outcomeIndex: idx,
+    price,
+    usd: usdAmt,
+    source: "hedge",
+    whale: null,
+    category: parent.category,
+    label: `🛡️ Хедж #${parent.id}`,
+    reason: `ИИ-риск: HEDGE к позиции #${parent.id}`,
+    allowMultiLeg: true,
+    aiDecision: { decision: "COPY", confidence: 0.7, sizeMultiplier: 1, reason: `хедж позиции #${parent.id}` },
   });
-  ctx.open.push(row);
-  ctx.portfolio.cashUsd -= fill.costUsd;
-  await ctx.log("trade", `🛡️ ХЕДЖ #${row.id} для #${parent.id}: ${market.outcomes[idx]} @ ${cents(fill.avgPrice)} · ${usd(fill.costUsd)}`);
 }
 
 // ── Помощники ────────────────────────────────────────────────────────────────

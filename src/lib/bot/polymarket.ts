@@ -155,7 +155,7 @@ export class PolymarketClient {
   get gammaApi() { return this.opts.settings.gammaApiUrl.replace(/\/$/, ""); }
   get clobApi() { return this.opts.settings.clobApiUrl.replace(/\/$/, ""); }
 
-  async fetchJson<T = unknown>(url: string, { retries = 3, timeoutMs = 15_000 } = {}): Promise<T | null> {
+  async fetchJson<T = unknown>(url: string, { retries = 2, timeoutMs = 12_000 } = {}): Promise<T | null> {
     const headers = { ...BROWSER_HEADERS, ...extraHeaders(this.opts.settings.extraHeadersJson) };
     const dispatcher = await getDispatcher(this.opts.settings.httpProxyUrl);
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -168,10 +168,10 @@ export class PolymarketClient {
         const init: RequestInit & { dispatcher?: Dispatcher } = { headers, signal: controller.signal, cache: "no-store" };
         if (dispatcher) init.dispatcher = dispatcher;
         const res = await fetch(url, init);
-        if (res.status === 429 || res.status === 425) { await sleep(5_000 * (attempt + 1)); continue; }
+        if (res.status === 429 || res.status === 425) { await sleep(3_000 * (attempt + 1)); continue; }
         if (res.status === 401 || res.status === 403) {
           this.blockedCount++;
-          if (attempt < retries) { await sleep(3_000 * (attempt + 1)); continue; }
+          if (attempt < retries) { await sleep(2_000 * (attempt + 1)); continue; }
           this.log(`🚫 HTTP ${res.status} от ${new URL(url).host} — гео/IP-блок. Укажи прокси в Настройках → Сеть.`);
           return null;
         }
@@ -180,9 +180,11 @@ export class PolymarketClient {
         return (await res.json()) as T;
       } catch (err) {
         const last = attempt === retries;
-        this.log(`⚠️  ${last ? "Ошибка" : "Повтор"} ${url.split("?")[0]}: ${(err as Error).message}`);
-        if (last) return null;
-        await sleep(2_000 * (attempt + 1));
+        if (last) {
+          this.log(`⚠️ Ошибка ${url.split("?")[0]}: ${(err as Error).message}`);
+          return null;
+        }
+        await sleep(1_000 * (attempt + 1));
       } finally {
         clearTimeout(timer);
       }
@@ -192,10 +194,12 @@ export class PolymarketClient {
 
   // ── Сделки / активность ──
   async fetchWhaleTrades(address: string, limit = 50): Promise<WhaleTrade[]> {
-    const primary = await this.fetchJson<unknown[]>(`${this.dataApi}/trades?user=${address}&limit=${limit}`, { retries: 2 });
-    if (Array.isArray(primary) && primary.length) return dedupeTrades(primary.map(normalizeTrade));
-    const fallback = await this.fetchJson<unknown[]>(`${this.dataApi}/activity?user=${address}&limit=${limit}&type=TRADE`, { retries: 1 });
-    if (Array.isArray(fallback)) return dedupeTrades(fallback.map(normalizeTrade).filter((t) => t.conditionId));
+    const primary = await this.fetchJson<unknown[]>(`${this.dataApi}/trades?user=${address}&limit=${limit}`, { retries: 1 });
+    if (Array.isArray(primary)) return dedupeTrades(primary.map(normalizeTrade));
+    if (primary === null) {
+      const fallback = await this.fetchJson<unknown[]>(`${this.dataApi}/activity?user=${address}&limit=${limit}&type=TRADE`, { retries: 1 });
+      if (Array.isArray(fallback)) return dedupeTrades(fallback.map(normalizeTrade).filter((t) => t.conditionId));
+    }
     return [];
   }
   async fetchRecentTrades(limit = 500): Promise<WhaleTrade[]> {
@@ -269,9 +273,20 @@ export class PolymarketClient {
 
   // ── CLOB: цены ──
   async fetchMidPrice(tokenId: string): Promise<number | null> {
-    const mid = await this.fetchJson<{ mid?: string }>(`${this.clobApi}/midpoint?token_id=${tokenId}`, { retries: 1 });
-    const midNum = mid ? parseFloat(String(mid.mid)) : NaN;
+    const midResp = await this.fetchJson<{ mid_price?: string; mid?: string }>(
+      `${this.clobApi}/midpoint?token_id=${tokenId}`,
+      { retries: 1 }
+    );
+    const midStr = midResp?.mid_price ?? midResp?.mid;
+    const midNum = midStr ? parseFloat(String(midStr)) : NaN;
     if (Number.isFinite(midNum) && midNum > 0) return midNum;
+
+    const book = await this.fetchOrderBook(tokenId);
+    if (book && Number.isFinite(book.bestBid) && Number.isFinite(book.bestAsk) && book.bestBid > 0 && book.bestAsk > 0) {
+      const mid = (book.bestBid + book.bestAsk) / 2;
+      if (Number.isFinite(mid) && mid > 0) return mid;
+    }
+
     const px = await this.fetchJson<{ price?: string }>(`${this.clobApi}/price?token_id=${tokenId}&side=SELL`, { retries: 1 });
     const pxNum = px ? parseFloat(String(px.price)) : NaN;
     return Number.isFinite(pxNum) && pxNum > 0 ? pxNum : null;
@@ -332,16 +347,70 @@ function dedupeTrades(ts: WhaleTrade[]): WhaleTrade[] {
   });
 }
 
-export function aggregateWhales(trades: WhaleTrade[], minTrades = 10): { address: string; name: string; trades: number; volumeUsd: number; lastTrade: number }[] {
-  const map = new Map<string, { address: string; name: string; trades: number; volumeUsd: number; lastTrade: number }>();
+export type WhaleCandidate = {
+  address: string;
+  wallet: string;
+  name: string;
+  trades: number;
+  volumeUsd: number;
+  lastTrade: number;
+  markets: string[];
+  buyRatio: number;
+  avgPrice: number;
+};
+
+export function aggregateWhales(trades: WhaleTrade[], minTrades = 3): WhaleCandidate[] {
+  const map = new Map<
+    string,
+    {
+      address: string;
+      wallet: string;
+      name: string;
+      trades: number;
+      buyTrades: number;
+      volumeUsd: number;
+      totalShares: number;
+      lastTrade: number;
+      marketsSet: Set<string>;
+    }
+  >();
+
   for (const t of trades) {
     const addr = t.proxyWallet;
     if (!addr) continue;
-    const cur = map.get(addr) ?? { address: addr, name: t.name || t.pseudonym || (addr.slice(0, 8) + "…"), trades: 0, volumeUsd: 0, lastTrade: 0 };
+    const cur = map.get(addr) ?? {
+      address: addr,
+      wallet: addr,
+      name: t.name || t.pseudonym || (addr.slice(0, 8) + "…"),
+      trades: 0,
+      buyTrades: 0,
+      volumeUsd: 0,
+      totalShares: 0,
+      lastTrade: 0,
+      marketsSet: new Set<string>(),
+    };
     cur.trades++;
-    cur.volumeUsd += t.size * t.price;
-    cur.lastTrade = Math.max(cur.lastTrade, t.timestamp);
+    if (t.side === "BUY") cur.buyTrades++;
+    const cost = (t.size || 0) * (t.price || 0);
+    cur.volumeUsd += cost;
+    cur.totalShares += t.size || 0;
+    cur.lastTrade = Math.max(cur.lastTrade, t.timestamp || 0);
+    if (t.title) cur.marketsSet.add(t.title);
     map.set(addr, cur);
   }
-  return [...map.values()].filter((w) => w.trades >= minTrades).sort((a, b) => b.volumeUsd - a.volumeUsd);
+
+  return [...map.values()]
+    .filter((w) => w.trades >= minTrades)
+    .map((w) => ({
+      address: w.address,
+      wallet: w.wallet,
+      name: w.name,
+      trades: w.trades,
+      volumeUsd: w.volumeUsd,
+      lastTrade: w.lastTrade,
+      markets: [...w.marketsSet].slice(0, 5),
+      buyRatio: w.trades ? w.buyTrades / w.trades : 0,
+      avgPrice: w.totalShares ? w.volumeUsd / w.totalShares : 0,
+    }))
+    .sort((a, b) => b.volumeUsd - a.volumeUsd);
 }

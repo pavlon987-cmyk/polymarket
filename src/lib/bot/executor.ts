@@ -33,7 +33,7 @@ export interface Executor {
  * - иногда base units (микро, 1e6)
  * - иногда уже decimal
  */
-function parseClobAmount(v: unknown): number {
+function parseClobAmount(v: unknown, expected?: number): number {
   if (v === null || v === undefined) return 0;
 
   if (typeof v === "number") return Number.isFinite(v) ? v : 0;
@@ -49,10 +49,17 @@ function parseClobAmount(v: unknown): number {
   const n = Number(s);
   if (!Number.isFinite(n)) return 0;
 
-  // эвристика: если похоже на микро-единицы
-  if (n >= 1_000_000) return n / 1e6;
+  const micro = n / 1e6;
+  const asIs = n;
 
-  return n;
+  if (expected === undefined || !(expected > 0)) {
+    return asIs <= 1000 ? asIs : micro;
+  }
+
+  const errMicro = Math.abs(micro - expected) / expected;
+  const errAsIs = Math.abs(asIs - expected) / expected;
+
+  return errMicro <= errAsIs ? micro : asIs;
 }
 
 function r2(n: number) {
@@ -68,9 +75,9 @@ export class PaperExecutor implements Executor {
     const est = await this.api.estimateFill(tokenId, "BUY", usd);
     const avg = est?.avgPrice ?? price;
 
-    // как и было: требуем ≥90% ликвидности
-    if (est && est.filled < usd * 0.9) {
-      return { ok: false, shares: 0, avgPrice: avg, costUsd: 0, error: `в стакане только $${est.filled.toFixed(2)} ликвидности` };
+    // требуем ≥99.9% ликвидности для предотвращения искажения PnL при partial fill
+    if (est && est.filled < usd * 0.999) {
+      return { ok: false, shares: 0, avgPrice: avg, costUsd: 0, error: `в стакане только $${est.filled.toFixed(2)} из $${usd.toFixed(2)}` };
     }
 
     if (avg - price > 0.05) {
@@ -87,9 +94,8 @@ export class PaperExecutor implements Executor {
     const est = await this.api.estimateFill(tokenId, "SELL", shares);
     const avg = est?.avgPrice ?? price;
 
-    // ФИКС: продаём только если в стакане можно исполнить почти всё (≥90%),
-    // иначе engine закроет позицию “целиком”, хотя по оценке продалось бы частично.
-    if (est && est.filled < shares * 0.9) {
+    // требуем ≥99.9% ликвидности на bid
+    if (est && est.filled < shares * 0.999) {
       return {
         ok: false,
         proceedsUsd: 0,
@@ -110,6 +116,7 @@ export class PaperExecutor implements Executor {
 }
 
 export async function getOnChainCollateralBalance(address: string): Promise<number | null> {
+  if (!address || typeof address !== "string") return null;
   const rpcs = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.gateway.tenderly.co",
@@ -180,8 +187,24 @@ export class LiveExecutor implements Executor {
     this.signer = new ethers.Wallet(process.env.POLYMARKET_PRIVATE_KEY as string);
     this.funder = (process.env.POLYMARKET_FUNDER_ADDRESS as string).trim();
 
-    const tmp = new ClobClient(this.host, this.chainId, this.signer);
-    this.creds = await tmp.createOrDeriveApiKey();
+    if (process.env.POLYMARKET_API_KEY && process.env.POLYMARKET_API_SECRET && process.env.POLYMARKET_PASSPHRASE) {
+      this.creds = {
+        key: process.env.POLYMARKET_API_KEY,
+        secret: process.env.POLYMARKET_API_SECRET,
+        passphrase: process.env.POLYMARKET_PASSPHRASE,
+      };
+    } else {
+      const tmp = new ClobClient(this.host, this.chainId, this.signer);
+      try {
+        this.creds = await tmp.deriveApiKey();
+      } catch {
+        this.creds = await tmp.createOrDeriveApiKey();
+      }
+    }
+
+    if (!this.creds?.secret) {
+      throw new Error("Не удалось получить secret для Polymarket CLOB API — проверь POLYMARKET_API_SECRET в .env");
+    }
 
     this.log(`🔐 CLOB V2 клиент готов (signer ${this.signer.address.slice(0, 10)}…, funder ${this.funder.slice(0, 10)}…)`);
     return { signer: this.signer, funder: this.funder, creds: this.creds, host: this.host, chainId: this.chainId };
@@ -189,9 +212,21 @@ export class LiveExecutor implements Executor {
 
   async balanceUsd(): Promise<number | null> {
     try {
-      const { signer, funder, creds, host } = await this.getCredsAndSigner();
+      const { signer, funder, creds, host, chainId } = await this.getCredsAndSigner();
       await syncBalanceAllowance(host, signer, creds);
 
+      // 1. Быстрый и точный баланс напрямую из Polymarket CLOB API
+      try {
+        const { ClobClient, AssetType } = await import("@polymarket/clob-client");
+        const client = new ClobClient(host, chainId, signer, creds, 3 as any, funder);
+        const res = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+        if (res?.balance) {
+          const bal = parseClobAmount(res.balance);
+          if (bal !== null && Number.isFinite(bal) && bal >= 0) return bal;
+        }
+      } catch {}
+
+      // 2. Ончейн-проверка pUSD / USDC на Polygon как надёжный fallback
       const onChainBal = await getOnChainCollateralBalance(funder);
       if (onChainBal !== null && Number.isFinite(onChainBal)) {
         return onChainBal;
@@ -203,9 +238,7 @@ export class LiveExecutor implements Executor {
         try {
           const onChainBal = await getOnChainCollateralBalance(funder);
           if (onChainBal !== null) return onChainBal;
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
       this.log(`⚠️ Баланс USDC недоступен: ${(err as Error).message}`);
       return null;
@@ -237,8 +270,9 @@ export class LiveExecutor implements Executor {
 
       if (!resp.ok) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: resp.error };
 
-      const costUsd = parseClobAmount(resp.makingAmount) || amountUsd;
-      const shares = parseClobAmount(resp.takingAmount) || (limitPx > 0 ? costUsd / limitPx : 0);
+      const costUsd = parseClobAmount(resp.makingAmount, amountUsd) || amountUsd;
+      const expectedShares = limitPx > 0 ? costUsd / limitPx : 0;
+      const shares = parseClobAmount(resp.takingAmount, expectedShares) || expectedShares;
 
       if (!(shares > 0)) return { ok: false, shares: 0, avgPrice: price, costUsd: 0, error: `BUY success, но takingAmount=0 (order ${resp.orderId})` };
 
@@ -273,7 +307,8 @@ export class LiveExecutor implements Executor {
 
       if (!resp.ok) return { ok: false, proceedsUsd: 0, avgPrice: price, error: resp.error };
 
-      const proceedsUsd = parseClobAmount(resp.takingAmount) || size * limitPx;
+      const expectedProceeds = size * limitPx;
+      const proceedsUsd = parseClobAmount(resp.takingAmount, expectedProceeds) || expectedProceeds;
       const avgPrice = proceedsUsd / size;
 
       this.log(`📤 LIVE SELL ${market.slice(0, 40)} — ${size} шт. за $${proceedsUsd.toFixed(2)} (order ${resp.orderId})`);
